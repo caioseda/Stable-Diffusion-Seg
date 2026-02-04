@@ -1465,7 +1465,7 @@ class LatentDiffusion(DDPM):
 
                             if save_dir is not None:
                                 slice_name = slice_path[0].split("/")[-1].split(".")[0] + f"_{idx}" + ".png"  # ori: .nii.gz
-                                save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-gts", slice_name.split(".")[-1]]))
+                                save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-pred", slice_name.split(".")[-1]]))
                                 save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
                                 save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
                                 

@@ -13,6 +13,10 @@ from torch import autocast
 from torch.utils.data import DataLoader
 from contextlib import contextmanager, nullcontext
 
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 from ldm.util import instantiate_from_config, default
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
@@ -23,6 +27,7 @@ from ldm.data.refuge2 import REFUGE2Validation, REFUGE2Test
 from ldm.data.sts3d import STS3DValidation, STS3DTest
 from ldm.data.cvc import CVCValidation, CVCTest
 from ldm.data.kseg import KSEGValidation, KSEGTest
+from ldm.data.vfss import VFSSVal, VFSSTest
 
 from scipy.ndimage import zoom
 
@@ -188,6 +193,14 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/model.ckpt"
         opt.outdir = "outputs/slice2seg-samples-cvc"
         dataset = KSEGTest()
+    elif opt.dataset == "vfss":
+        run = "2026-01-15T19-46-27_vfss_experiment" 
+        print("Evaluate on vfss dataset in binary segmentation manner.")
+        opt.config = glob.glob(os.path.join("logs", run, "configs", "*-project.yaml"))[0]
+        opt.ckpt = f"logs/{run}/checkpoints/epoch=661-step=89999.ckpt"
+        opt.outdir = "outputs/slice2seg-samples-vfss"
+        dataset = VFSSTest()
+    
     else:
         raise NotImplementedError(f"Not implement for dataset {opt.dataset}")
 
@@ -214,17 +227,21 @@ def main():
         outpath = os.path.join(opt.outdir, str(opt.seed))
         os.makedirs(outpath, exist_ok=True)
 
-        metrics_dict, _ = model.log_dice(data=data, save_dir=outpath if opt.save_results else None) 
+        metrics_dict, _ = model.log_dice(data=data, save_dir=outpath) 
 
         dice_list = metrics_dict["val_avg_dice"]
         iou_list = metrics_dict["val_avg_iou"]
         print(f"\033[31m[Mean Dice][{opt.dataset}][direct]: {sum(dice_list) / len(dice_list)}\033[0m")
         print(f"\033[31m[Mean  IoU][{opt.dataset}][direct]: {sum(iou_list) / len(iou_list)}\033[0m")
+        print(f"Just for comparison, i think the result is also is stores on\n Dice: {metrics_dict['val_avg_dice/direct_ema']} IoU: {metrics_dict['val_avg_iou/direct_ema']}")
+
+        print(f"\033[31m[Mean Dice][{opt.dataset}][ddim]: {metrics_dict['val_avg_dice/ddim_ema']}\033[0m")
+        print(f"\033[31m[Mean  IoU][{opt.dataset}][ddim]: {metrics_dict['val_avg_iou/ddim_ema']}\033[0m")
 
         if opt.times > 1:
             print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
             f" \nEnjoy.")
-
+        
 
 if __name__ == "__main__":
     main()

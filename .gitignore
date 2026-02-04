@@ -27,6 +27,7 @@ data/synapse/Abdomen/
 data/synapse/train/
 data/synapse/test/
 data/synapse/test_vol/
+outputs/
 
 # logs
 logs/

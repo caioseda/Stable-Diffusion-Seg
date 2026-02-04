@@ -1883,7 +1883,7 @@ class SDSeg(LatentDiffusion):
 
                         if save_dir is not None:
                             slice_name = slice_path[0].split("/")[-1]
-                            save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-gts", slice_name.split(".")[-1]]))
+                            save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-pred", slice_name.split(".")[-1]]))
                             save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
                             save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
                             
@@ -1893,9 +1893,9 @@ class SDSeg(LatentDiffusion):
                             save_cond = ((slice+1)/2*255).astype(np.uint8)
                             save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
                             
-                            # Image.fromarray(save_pred).save(save_pred_path)
+                            Image.fromarray(save_pred).save(save_pred_path)
                             # Image.fromarray(save_all).save(save_all_path)
-                            Image.fromarray(save_logits).save(save_logits_path)
+                            # Image.fromarray(save_logits).save(save_logits_path)
                             
 
                         # log non-empty examples for debugging
@@ -1997,12 +1997,12 @@ class SDSeg(LatentDiffusion):
         seg_label_dict.update({"latent_seg_label-direct_ema": seg_label_pair[0],
                                "image_seg_label-direct-ema": seg_label_pair[1]})
         
-        # print("ddim steps: ", steps)
-        # ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="ddim", save_dir=save_dir, ddim_steps=steps)
-        # metrics_dict.update({"val_avg_dice/ddim_ema": np.mean(np.array(ema_dice))})
-        # metrics_dict.update({"val_avg_iou/ddim_ema": np.mean(np.array(ema_iou))})
-        # seg_label_dict.update({"latent_seg_label-ddim_ema": seg_label_pair[0],
-        #                     "image_seg_label-ddim-ema": seg_label_pair[1]})
+        print("ddim steps: ", ddim_steps)
+        ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="ddim", save_dir=save_dir, ddim_steps=ddim_steps)
+        metrics_dict.update({"val_avg_dice/ddim_ema": np.mean(np.array(ema_dice))})
+        metrics_dict.update({"val_avg_iou/ddim_ema": np.mean(np.array(ema_iou))})
+        seg_label_dict.update({"latent_seg_label-ddim_ema": seg_label_pair[0],
+                            "image_seg_label-ddim-ema": seg_label_pair[1]})
 
 
         # choose one as the segmentation monitor
