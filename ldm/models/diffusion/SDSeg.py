@@ -553,6 +553,15 @@ class LatentDiffusion(DDPM):
         return denoise_grid
 
     def get_first_stage_encoding(self, encoder_posterior):
+        """Convert first-stage encoder output into the latent tensor used by diffusion.
+
+        The first-stage encoder may return either:
+        - a `DiagonalGaussianDistribution` from a KL autoencoder
+        - a tensor directly
+
+        This helper samples or forwards that latent and then applies the global
+        `scale_factor` expected by the diffusion model.
+        """
         if isinstance(encoder_posterior, DiagonalGaussianDistribution):
             z = encoder_posterior.sample()
         elif isinstance(encoder_posterior, torch.Tensor):
@@ -562,6 +571,18 @@ class LatentDiffusion(DDPM):
         return self.scale_factor * z
 
     def get_learned_conditioning(self, c):
+        """Encode the conditioning input into the representation consumed by the UNet.
+
+        In SDSeg this is usually applied to the input image, not the mask.
+        For your 2D binary segmentation setup, the typical flow is:
+        1. start from an image tensor in pixel space
+        2. run the conditioning model encoder
+        3. obtain a latent conditioning tensor used as `c_concat`
+
+        If the conditioning encoder returns a Gaussian distribution, this method
+        uses its mode instead of sampling so the conditioning signal stays
+        deterministic.
+        """
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
                 c = self.cond_stage_model.encode(c)
@@ -1405,12 +1426,40 @@ class LatentDiffusion(DDPM):
         return x
     
 class SDSeg(LatentDiffusion):
+    """Segmentation-specific latent diffusion model.
+
+    In your 2D binary segmentation setup, the model learns to denoise a latent
+    representation of the segmentation mask while being conditioned on the input
+    image latent (`c_concat`) and, optionally, on a class id (`c_crossattn`).
+
+    Practical mental model:
+    1. Encode the segmentation mask into latent space.
+    2. Add diffusion noise to that latent mask.
+    3. Ask the UNet to remove the noise while looking at the image latent.
+    4. Decode the predicted latent back into a mask for metrics/logging.
+    """
     def __init__(self, first_stage_config, cond_stage_config, load_only_unet=True, num_classes=2, *args, **kwargs):
+        """Build the segmentation diffusion model.
+
+        `num_classes=2` corresponds to binary segmentation:
+        background class `0` and foreground class `1`.
+        """
         super().__init__(first_stage_config, cond_stage_config, load_only_unet=load_only_unet, *args, **kwargs)
         self.num_classes = num_classes
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=True):  # modified, only load unet
-        """load only pretrained unet in training phase, load the entire model in testing phase"""
+        """Load weights from a checkpoint.
+
+        Typical usage in this project:
+        - `only_model=True`: load only the diffusion UNet weights, which is the
+          common fine-tuning path for segmentation training.
+        - `only_model=False`: restore the full pipeline, including first-stage
+          and conditioning modules, which is more convenient for evaluation.
+
+        When the pretrained UNet shape does not exactly match the current UNet,
+        this method keeps the compatible parameters and zero-fills a known input
+        channel mismatch case instead of failing hard.
+        """
         sd = self.model.diffusion_model.state_dict()
         self.unet_sd_keys = set(map(lambda x: x.split(".")[0], sd.keys()))
         
@@ -1478,6 +1527,12 @@ class SDSeg(LatentDiffusion):
                 print(f"\033[31m[Unexpected Keys]\033[0m: {unexpected}\n")
 
     def training_step(self, batch, batch_idx):
+        """Run one optimization step and log the training losses.
+
+        This overrides the parent implementation mainly to drop `loss_vlb` from
+        the progress-bar logging, while still using the same `shared_step`
+        training flow.
+        """
         loss, loss_dict = self.shared_step(batch)
         loss_dict.pop("train/loss_vlb")
 
@@ -1494,6 +1549,12 @@ class SDSeg(LatentDiffusion):
     
     @torch.no_grad()
     def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+        """Initialize latent scaling from the first training batch when enabled.
+
+        The first-stage encoder can produce latents with a dataset-dependent
+        standard deviation. When `scale_by_std` is active, this hook estimates
+        that std once from the first batch and stores `scale_factor = 1/std`.
+        """
         # only for very first batch
         if self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0:  # and not self.restarted_from_ckpt:
             if self.scale_by_std:
@@ -1511,6 +1572,12 @@ class SDSeg(LatentDiffusion):
             self.log("val_avg_dice", 0, prog_bar=False, logger=True, on_step=True, on_epoch=False)
 
     def get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
+        """Decode a list of latent samples into visualization grids.
+
+        Returns two grids:
+        - decoded segmentation images at each denoising step
+        - the corresponding latent tensors arranged in the same order
+        """
         denoise_row = []
         denoise_row_latent = []
         for zd in tqdm(samples, desc=desc):
@@ -1533,13 +1600,25 @@ class SDSeg(LatentDiffusion):
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None):
+        """Prepare segmentation latent, conditioning latent, and class id.
+
+        For the SDSeg training path this method effectively produces:
+        - `z`: latent segmentation mask used as the diffusion target
+        - `c`: conditioning latent derived from the input image
+        - `x`: original tensor associated with `k` before first-stage encoding
+        - `cls_id`: per-sample class id for class-conditional variants
+
+        In the common binary 2D setup, `cls_id` is usually present for API
+        consistency, while the main signal comes from `c_concat` (the image
+        latent) and the decoded output is thresholded into foreground/background.
+        """
         x = DDPM.get_input(self, batch, k)
-        # print(batch["class_id"], batch["class_id"].shape)
+
         cls_id = batch["class_id"][:, 0]  
-        # print(cls_id, cls_id.shape)
         if bs is not None:
             x = x[:bs]
         x = x.to(self.device)
+
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
@@ -1586,11 +1665,19 @@ class SDSeg(LatentDiffusion):
         return out
 
     def shared_step(self, batch, **kwargs):
+        """Extract inputs from the batch and delegate to `forward`."""
         x, c, seg_label, cls_id = self.get_input(batch, self.first_stage_key)
         loss = self(x, c, cls_id, seg_label)
         return loss
 
     def forward(self, x, c, cls_id, *args, **kwargs):
+        """Sample timesteps, build the conditioning dict, and compute losses.
+
+        `x` is the clean latent segmentation target. The conditioning dict is
+        built in the "hybrid" format expected by the wrapped diffusion UNet:
+        - `c_concat=[c]`: image latent concatenated as spatial conditioning
+        - `c_crossattn=[cls_id]`: optional class-token style conditioning
+        """
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         assert t.shape[0] == cls_id.shape[0], (t.shape, cls_id.shape, cls_id.shape[0])
         if self.model.conditioning_key is not None:
@@ -1604,10 +1691,27 @@ class SDSeg(LatentDiffusion):
         return self.p_losses(x, c, t, *args, **kwargs)
     
     def get_loss_seg_regression(self, x_start, x_noisy, t, model_output, seg_label=None):
+        """Reconstruct the clean latent mask and compare it with the target.
+
+        Despite the name, this is not a Dice/BCE loss on decoded masks. It is a
+        latent-space reconstruction loss between:
+        - `x_start`: the ground-truth latent mask
+        - `x_recon`: the latent mask reconstructed from the predicted noise
+        """
         x_recon = self.predict_start_from_noise(x_noisy, t, noise=model_output)
         return self.get_loss(x_recon, x_start, mean=False)  # loss type according to `self.loss_type`
     
     def p_losses(self, x_start, cond, t, seg_label, noise=None):
+        """Compute the SDSeg training objective at timestep `t`.
+
+        The total loss combines:
+        - the standard diffusion noise-prediction loss (`loss_simple`)
+        - a latent mask reconstruction loss (`loss_seg`)
+        - an optional VLB term inherited from DDPM
+
+        For binary 2D segmentation, `loss_seg` is the term that most directly
+        encourages the denoised latent to look like the target mask latent.
+        """
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
@@ -1657,8 +1761,25 @@ class SDSeg(LatentDiffusion):
     
     @torch.no_grad()
     def log_dice(self, data=None, save_dir=None, ddim_steps=50):
+        """Run segmentation inference and compute Dice/IoU metrics.
+
+        This is the main evaluation entry point. It supports three inference
+        styles:
+        - `direct`: one-step prediction from pure noise at the final timestep
+        - `ddim`: iterative DDIM sampling
+        - `plms`: iterative PLMS sampling
+
+        In 2D binary case, the relevant path is:
+        1. encode the input image into the conditioning latent
+        2. generate one segmentation latent prediction
+        3. decode it back to image space
+        4. threshold at `0.5` to obtain a binary mask
+        5. compare foreground class `1` against the ground truth
+        """
+
         
         if data is None: # if dataset is not None, means the call comes from inference script.
+            print(f"\033[32m[ATT] No dataloader provided to log_dice(), using trainer datamodule's test dataset\033[0m")
             dataset = self.trainer.datamodule.datasets["test"]
             data = DataLoader(dataset, batch_size=1, shuffle=False, pin_memory=True)
 
@@ -1667,15 +1788,32 @@ class SDSeg(LatentDiffusion):
         seg_label_dict = dict()
 
         def get_dice(data, used_sampler="ddim", save_dir=None, ddim_steps=50):
-            """
-            Args:
+            """Select a sampler, run inference, and return aggregate metrics.
+            
+             Args:
                 used_sampler: "direct", "ddim", "plms" ( "direct" -> self.predict_start_from_noise() )
 
             Returns:
                 return ema_dice_list
+
             """
 
             def get_dice_loop(data, sampler, use_direct=False, noise=None, save_dir=None, ddim_steps=50):
+                """Inner validation loop shared by the available samplers.
+
+                Responsibilities of this helper:
+                - iterate over the validation set
+                - turn each input image (or slice) into conditioning latents
+                - predict a segmentation latent either directly or with a sampler
+                - decode the latent back into mask/logit images
+                - accumulate Dice/IoU statistics
+                - optionally store debug visualizations and logging tensors
+
+                For binary 2D images:
+                - `samples_pred[0]` is the only latent prediction used
+                - the decoded mask is mapped from `[-1, 1]` to `[0, 1]`
+                - channels are averaged and thresholded at `0.5`
+                """
                 dice_list = 0.
                 iou_list = 0.
                 label_latent_list, samples_latent_list, cond_latent_list = list(), list(), list()
@@ -1816,6 +1954,8 @@ class SDSeg(LatentDiffusion):
                         pbar_sub.close()
 
                     else:   # for 2D slices inference
+                        # This is the branch used by a standard 2D binary dataset:
+                        # one image -> one latent prediction -> one decoded mask.
                         slice = image
                         input = torch.from_numpy(image).unsqueeze(0).float().cuda()
                         label = label[:, :, 0]
@@ -1865,6 +2005,9 @@ class SDSeg(LatentDiffusion):
                             out_p = out.softmax(dim=2)
                             out = out_p.argmax(dim=2, keepdim=True).repeat(1, 1, 3).numpy()    # h w c==3
                         else:
+                            # Binary segmentation path:
+                            # decode the latent mask, rescale to [0, 1], average the
+                            # output channels, then threshold to obtain foreground/background.
                             x_samples_ddim = self.decode_first_stage(samples_pred[0])
                             x_samples_ddim = torch.clamp(
                                 (x_samples_ddim + 1.0) / 2.0 , min=0.0, max=1.0
@@ -2011,10 +2154,11 @@ class SDSeg(LatentDiffusion):
 
         # self.model.train()    # ImageLogger will handle this
         return metrics_dict, seg_label_dict
-    
+
     @staticmethod
     @torch.no_grad()
     def prepare_latent_to_log(latent):
+        """Arrange latent tensors into a grid that TensorBoard/image loggers can display."""
         # expected input shape: b c h w -> b c 1 h w == n_log_step, n_row, C, H, W
         latent = latent.unsqueeze(2)
         latent_grid = rearrange(latent, 'n b c h w -> b n c h w')
@@ -2025,6 +2169,15 @@ class SDSeg(LatentDiffusion):
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=True, ddim_eta=1., return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
                    plot_diffusion_rows=True, **kwargs):  # TODO: ddim_steps
+        """Create debug visualizations for masks, latents, and sampling trajectories.
+
+        This is a qualitative companion to `log_dice`. It logs:
+        - input masks and reconstructions
+        - conditioning images and conditioning latents
+        - forward diffusion rows
+        - reverse denoising samples
+        - progressive denoising snapshots
+        """
 
         use_ddim = ddim_steps is not None
         if use_ddim:
@@ -2138,6 +2291,12 @@ class SDSeg(LatentDiffusion):
         return log
 
     def configure_optimizers(self):
+        """Create the optimizer for the diffusion UNet and optional extra modules.
+
+        By default this optimizes the full UNet. If the model is class-
+        conditional, `label_emb` receives a larger learning rate. The condition
+        encoder and learned log-variance are included only when enabled.
+        """
         lr = self.learning_rate
         # the whole unet except `label_embed`
         params_dict = [{"params": self.model.diffusion_model.input_blocks.parameters()}] + \
