@@ -30,7 +30,7 @@ class VFSSDatasetBase(VFSSImageDataset):
         
         assert image_size == segmentation_size, "Image and segmentation size mismatch!"
         if self.size is not None:
-            assert self.size > 0, "Size must be positive!"
+            assert self.size > 0, "Size must be positive!"      
             assert image_size == (self.size, self.size), "Image size does not match the specified size!"
             assert segmentation_size == (self.size, self.size), "Segmentation size does not match the specified size!"
 
@@ -69,7 +69,7 @@ class VFSSDatasetBase(VFSSImageDataset):
 class VFSSTrain(VFSSDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
-            f'../vfss-data-split/data/metadados/video_frame_metadata_train.csv',
+            f'../dados_inca/metadados/video_frame_metadata_train.csv',
             target='mask',
             from_images=True,
             return_single_target=True,
@@ -80,7 +80,7 @@ class VFSSTrain(VFSSDatasetBase):
 class VFSSVal(VFSSDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
-            f'../vfss-data-split/data/metadados/video_frame_metadata_val.csv',
+            f'../dados_inca/metadados/video_frame_metadata_val.csv',
             target='mask',
             from_images=True,
             return_single_target=True, 
@@ -91,7 +91,7 @@ class VFSSVal(VFSSDatasetBase):
 class VFSSTest(VFSSDatasetBase):
     def __init__(self, **kwargs):
         super().__init__(
-            f'../vfss-data-split/data/metadados/video_frame_metadata_test.csv',
+            f'../dados_inca/metadados/video_frame_metadata_test.csv',
             target='mask',
             from_images=True,
             return_single_target=True,
