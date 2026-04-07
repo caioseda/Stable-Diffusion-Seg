@@ -1,0 +1,2 @@
+python -u main.py --base configs/SDSeg/vfss-inca.yaml -t --gpus 0, --name experiment_old_vfss > nohup/experiment-old-vfss.log 2>&1 &
+python -u main.py --base configs/SDSeg/vfss-new-inca.yaml -t --gpus 0, --name experiment_name > nohup/experiment-new-vfss.log 2>&1 &

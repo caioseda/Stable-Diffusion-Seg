@@ -7,7 +7,7 @@ from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
-import time
+from datetime import datetime
 from pytorch_lightning import seed_everything
 from torch import autocast
 from torch.utils.data import DataLoader
@@ -27,7 +27,8 @@ from ldm.data.refuge2 import REFUGE2Validation, REFUGE2Test
 from ldm.data.sts3d import STS3DValidation, STS3DTest
 from ldm.data.cvc import CVCValidation, CVCTest
 from ldm.data.kseg import KSEGValidation, KSEGTest
-from ldm.data.vfss import VFSSVal, VFSSTest
+# from ldm.data.vfss import VFSSVal, VFSSTest
+from ldm.data.vfss_new import VFSSIncaTest
 
 from scipy.ndimage import zoom
 
@@ -36,6 +37,23 @@ from scipy.ndimage import zoom
 
 
 def prepare_for_first_stage(x, gpu=True):
+    """Convert an image batch to the layout expected by the first-stage encoder.
+
+    Expected input:
+    - single image: `(H, W, C)`
+    - batch of images: `(B, H, W, C)`
+
+    Returned tensor:
+    - `(B, C, H, W)` in `float32`
+
+    In this project the helper is mainly used before
+    `model.get_learned_conditioning(...)`, so it prepares a 2D image for the
+    conditioning autoencoder by:
+    - cloning/detaching the tensor
+    - adding a batch dimension when needed
+    - converting channel-last to channel-first
+    - optionally moving it to CUDA
+    """
     x = x.clone().detach()
     if len(x.shape) == 3:
         x = x[None, ...]
@@ -156,6 +174,7 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/last.ckpt"      # name of the trained model
         opt.outdir = "outputs/slice2seg-samples-synapse-b"
         dataset = SynapseValidationVolume(num_classes=2)
+    
     elif opt.dataset == "synapse-m":
         run = "the name of your experiment" 
         print("Evaluate on synapse dataset in multi-organ segmentation manner.")
@@ -163,6 +182,7 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/epoch=107-step=14999.ckpt"
         opt.outdir = "outputs/slice2seg-samples-synapse-m"
         dataset = SynapseValidationVolume(num_classes=9)
+    
     elif opt.dataset == "refuge2-b":
         run = "the name of your experiment" 
         print("Evaluate on refuge2 dataset in binary segmentation manner.")
@@ -171,6 +191,7 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/model.ckpt"
         opt.outdir = "outputs/slice2seg-samples-refuge2-b"
         dataset = REFUGE2Test()
+    
     elif opt.dataset == "sts-3d": 
         run = "the name of your experiment" 
         print("Evaluate on sts-3d dataset in binary segmentation manner.")
@@ -179,6 +200,7 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/epoch=199-step=124999.ckpt"
         opt.outdir = "outputs/slice2seg-samples-sts-3d"
         dataset = STS3DTest()
+    
     elif opt.dataset == "cvc":
         run = "the name of your experiment" 
         print("Evaluate on cvc dataset in binary segmentation manner.")
@@ -186,6 +208,7 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/model.ckpt"
         opt.outdir = "outputs/slice2seg-samples-cvc"
         dataset = CVCTest()
+    
     elif opt.dataset == "kseg":
         run = "the name of your experiment" 
         print("Evaluate on kseg dataset in binary segmentation manner.")
@@ -193,13 +216,24 @@ def main():
         opt.ckpt = f"logs/{run}/checkpoints/model.ckpt"
         opt.outdir = "outputs/slice2seg-samples-cvc"
         dataset = KSEGTest()
-    elif opt.dataset == "vfss":
+    
+    elif opt.dataset == "inca":
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         run = "2026-01-15T19-46-27_vfss_experiment" 
         print("Evaluate on vfss dataset in binary segmentation manner.")
         opt.config = glob.glob(os.path.join("logs", run, "configs", "*-project.yaml"))[0]
         opt.ckpt = f"logs/{run}/checkpoints/epoch=661-step=89999.ckpt"
         opt.outdir = "outputs/slice2seg-samples-vfss"
-        dataset = VFSSTest()
+        dataset = VFSSIncaTest()
+    
+    # elif opt.dataset == "inca"
+    #     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    #     run = "2026-01-15T19-46-27_vfss_experiment" 
+    #     print("Evaluate on vfss dataset in binary segmentation manner.")
+    #     opt.config = glob.glob(os.path.join("logs", run, "configs", "*-project.yaml"))[0]
+    #     opt.ckpt = f"logs/{run}/checkpoints/epoch=661-step=89999.ckpt"
+    #     opt.outdir = "outputs/slice2seg-samples-vfss"
+    #     dataset = VFSSTest()
     
     else:
         raise NotImplementedError(f"Not implement for dataset {opt.dataset}")
