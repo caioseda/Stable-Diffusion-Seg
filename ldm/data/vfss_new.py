@@ -281,7 +281,14 @@ class VFSSWindowImageDataset(Dataset):
         if mask.ndim == 3 and mask.shape[0] == 1:
             mask = mask.squeeze(0)
 
-        mask = (mask > 0).long()
+        # Binarize the mask
+        mask = (mask > 0).float()  
+
+        # Scale to [-1, 1]
+        mask = (mask.float() * 2.0) - 1.0 
+        
+        if self.repeat_channels:
+            mask = mask.unsqueeze(-1).repeat(1,1,3)
         
         logger.debug(f"Preprocessed mask dimension: {mask.shape} ({mask.dtype}). Range: [{mask.min()}, {mask.max()}]")
         return mask
@@ -368,7 +375,6 @@ class VFSSWindowImageDataset(Dataset):
             returns['image'] = einops.rearrange(returns['image'], 'c h w -> h w c')
         elif returns['image'].ndim != 4:
             raise ValueError(f"Unsupported VFSS image shape: {tuple(returns['image'].shape)}")
-        returns['segmentation'] = returns['segmentation'].unsqueeze(-1).repeat(1,1,3)
         returns['file_path_'] = row.target_path
         
         return returns
