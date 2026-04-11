@@ -320,7 +320,7 @@ class DDPM(pl.LightningModule):
         loss = self.get_loss(model_out, target, mean=False).mean(dim=[1, 2, 3])
 
         log_prefix = 'train' if self.training else 'val'
-
+        
         loss_dict.update({f'{log_prefix}/loss_simple': loss.mean()})
         loss_simple = loss.mean() * self.l_simple_weight
 
@@ -2140,12 +2140,12 @@ class SDSeg(LatentDiffusion):
         seg_label_dict.update({"latent_seg_label-direct_ema": seg_label_pair[0],
                                "image_seg_label-direct-ema": seg_label_pair[1]})
         
-        print("ddim steps: ", ddim_steps)
-        ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="ddim", save_dir=save_dir, ddim_steps=ddim_steps)
-        metrics_dict.update({"val_avg_dice/ddim_ema": np.mean(np.array(ema_dice))})
-        metrics_dict.update({"val_avg_iou/ddim_ema": np.mean(np.array(ema_iou))})
-        seg_label_dict.update({"latent_seg_label-ddim_ema": seg_label_pair[0],
-                            "image_seg_label-ddim-ema": seg_label_pair[1]})
+        # print("ddim steps: ", ddim_steps)
+        # ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="ddim", save_dir=save_dir, ddim_steps=ddim_steps)
+        # metrics_dict.update({"val_avg_dice/ddim_ema": np.mean(np.array(ema_dice))})
+        # metrics_dict.update({"val_avg_iou/ddim_ema": np.mean(np.array(ema_iou))})
+        # seg_label_dict.update({"latent_seg_label-ddim_ema": seg_label_pair[0],
+        #                     "image_seg_label-ddim-ema": seg_label_pair[1]})
 
 
         # choose one as the segmentation monitor
