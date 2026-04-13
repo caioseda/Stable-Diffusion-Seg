@@ -76,6 +76,22 @@ class VFSSWindowImageDataset(Dataset):
             self.target_transform = T.Resize(
                 self.image_size, interpolation=self.mask_interpolation
             )
+
+        self.rows = self.video_frame_df.to_dict("records")
+
+        video_to_folder = (
+            self.video_frame_df.groupby("video_id")["image_path"]
+            .first()
+            .to_dict()
+        )
+
+        self.video_total_frames = {}
+        for video_id, image_path in video_to_folder.items():
+            image_folder_path = os.path.dirname(image_path)
+            image_folder_path = self.__resolve_path(image_folder_path)
+            self.video_total_frames[int(video_id)] = sum(
+                1 for f in os.listdir(image_folder_path) if f.endswith(".png")
+            )
     
     def __len__(self):
         return self.video_frame_df.shape[0]
@@ -98,8 +114,9 @@ class VFSSWindowImageDataset(Dataset):
         
         path = self.__resolve_path(path)
         
-        mask = Image.open(path).convert("L")
-        mask = T.PILToTensor()(mask)
+        with Image.open(path) as img:
+            mask = img.convert("L")
+            mask = T.PILToTensor()(mask)
 
         return mask
 
@@ -144,8 +161,10 @@ class VFSSWindowImageDataset(Dataset):
             image_color = 'RGB'
 
         path = self.__resolve_path(path)
-        image = Image.open(path).convert(image_color)
-        image = T.PILToTensor()(image)
+
+        with Image.open(path) as img:
+            image = img.convert(image_color)
+            image = T.PILToTensor()(image)
 
         return image
     
@@ -155,15 +174,8 @@ class VFSSWindowImageDataset(Dataset):
             raise FileNotFoundError(f"Path not found: {path}")
         return Path(path).expanduser().resolve()
 
-    def get_total_frames_in_video(self, video_id: Union[str , int], filetype='.png'):
-        ''' Get the total number of frames in a video based on the video_id '''
-        video_frame_row = self.video_frame_df[self.video_frame_df.video_id == video_id].iloc[0]
-        image_folder_path = os.path.dirname(video_frame_row.image_path)
-        image_folder_path = self.__resolve_path(image_folder_path)
-
-        frame_files = [f for f in os.listdir(image_folder_path) if f.endswith(filetype)]
-        total_frames = len(frame_files)
-        return total_frames
+    def get_total_frames_in_video(self, video_id: Union[str, int], filetype=".png"):
+        return self.video_total_frames[int(video_id)]
 
     def get_valid_window(self, frame_id, total_frames, window_size=3, stride=1, boundary_mode='repeat'):
         if window_size % 2 == 0:
@@ -235,7 +247,6 @@ class VFSSWindowImageDataset(Dataset):
                 image = torch.zeros((n_channels, self.image_size[0], self.image_size[1]))
             images.append(image)
 
-        self.__current_image_original_dim = (images[0].shape[-1], images[0].shape[-2])
         images = torch.stack(images, dim=0)
 
         if repeat_channels and color == 'greyscale':
@@ -361,7 +372,6 @@ class VFSSWindowImageDataset(Dataset):
             # 'momento': row.momento,
             # 'procedimento': row.procedimento,
             'selected_labeler': row.selected_labeler,
-            'original_dim': self.__current_image_original_dim
         }
 
         returns = {}
