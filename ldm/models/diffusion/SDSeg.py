@@ -1779,8 +1779,8 @@ class SDSeg(LatentDiffusion):
 
         
         if data is None: # if dataset is not None, means the call comes from inference script.
-            print(f"\033[32m[ATT] No dataloader provided to log_dice(), using trainer datamodule's test dataset\033[0m")
-            dataset = self.trainer.datamodule.datasets["test"]
+            print(f"\033[32m[ATT] No dataloader provided to log_dice(), using trainer datamodule's validation dataset\033[0m")
+            dataset = self.trainer.datamodule.datasets["validation"]
             data = DataLoader(dataset, batch_size=1, shuffle=False, pin_memory=True)
 
         # self.model.eval()     # ImageLogger will handle this
