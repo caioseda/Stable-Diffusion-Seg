@@ -1359,7 +1359,7 @@ class LatentDiffusion(DDPM):
     def log_dice(self, data=None, save_dir=None, ddim_steps=50):
         
         if data is None: # if dataset is not None, means the call comes from inference script.
-            dataset = self.trainer.datamodule.datasets["test"]
+            dataset = self.trainer.datamodule.datasets["validation"]
             data = DataLoader(dataset, batch_size=1, shuffle=False, pin_memory=True)
 
         # self.model.eval()     # ImageLogger will handle this
