@@ -38,7 +38,7 @@ from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_t
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.modules.temporal_modules.tcm import TemporalContextBlock
-from scripts.slice2seg import prepare_for_first_stage, dice_score, iou_score
+from scripts.slice2seg import dice_score, iou_score
 from ldm.data.synapse import colorize
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -1922,6 +1922,140 @@ class SDSeg(LatentDiffusion):
                     slice_path = prompts["file_path_"]
                     image = prompts["image"]  # 1 256 256 3  (1, H, W, D)
                     label = prompts["segmentation"]  # 1 256 256 3  (1, H, W, D)
+
+                    is_vfss_window_batch = (
+                        torch.is_tensor(image) and image.ndim == 5 and
+                        torch.is_tensor(label) and label.ndim in [3, 4]
+                    )
+                    is_vfss_single_frame_batch = (
+                        torch.is_tensor(image) and image.ndim == 4 and image.shape[-1] in [1, 3] and
+                        torch.is_tensor(label) and label.ndim in [3, 4]
+                    )
+
+                    if is_vfss_window_batch or is_vfss_single_frame_batch:
+                        if image.shape[0] != 1:
+                            raise ValueError("log_dice currently expects batch_size=1 for VFSS validation.")
+
+                        c_latent = self._build_conditioning_latent(image)
+                        c = dict(c_concat=[c_latent], c_crossattn=[None])
+
+                        if is_vfss_window_batch:
+                            center_image = image[:, image.shape[1] // 2]
+                            slice = rearrange(center_image[0].detach().cpu(), 'c h w -> h w c').numpy()
+                        else:
+                            slice = image[0].detach().cpu().numpy()
+
+                        label_np = label[0].detach().cpu().numpy() if label.ndim == 4 else label.detach().cpu().numpy()
+                        if label_np.ndim == 3 and label_np.shape[0] in [1, 3]:
+                            label_np = rearrange(label_np, 'c h w -> h w c')
+                        label = label_np[:, :, 0] if label_np.ndim == 3 else label_np
+                        assert label.max() == self.num_classes - 1, label.max()
+
+                        samples_pred = list()
+                        if use_direct:
+                            noise = default(noise, lambda: torch.randn_like(c["c_concat"][0]))
+                            final_t = torch.tensor([self.num_timesteps - 1], device=self.device).long()
+                            if self.num_classes > 2:
+                                for cls in range(0, self.num_classes):
+                                    c["c_crossattn"] = [torch.tensor([cls], device=self.device)]
+                                    model_output = self.apply_model(noise, final_t, c)
+                                    pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
+                                    samples_pred.append(pred_tmp)
+                            else:
+                                model_output = self.apply_model(noise, final_t, c)
+                                pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
+                                samples_pred.append(pred_tmp)
+                        else:
+                            pred_tmp, _ = sampler.sample(
+                                S=ddim_steps,
+                                conditioning=c,
+                                shape=(self.channels, self.image_size, self.image_size),
+                                batch_size=1,
+                                verbose=False,
+                                unconditional_guidance_scale=1.0,
+                                unconditional_conditioning=None,
+                                eta=1.,
+                                x_T=None
+                            )
+                            samples_pred.append(pred_tmp)
+
+                        out = torch.zeros((256, 256, self.num_classes))
+                        if self.num_classes > 2:
+                            for cls in range(0, self.num_classes):
+                                x_samples_ddim = self.decode_first_stage(samples_pred[cls])
+                                if cls == 0:
+                                    x_samples_ddim *= -1
+                                x_samples_ddim = torch.mean(x_samples_ddim, dim=1, keepdim=False)
+                                out[:, :, cls] = x_samples_ddim[0, ...]
+                            out_p = out.softmax(dim=2)
+                            out = out_p.argmax(dim=2, keepdim=True).repeat(1, 1, 3).numpy()
+                        else:
+                            x_samples_ddim = self.decode_first_stage(samples_pred[0])
+                            x_samples_ddim = torch.clamp(
+                                (x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0
+                            )
+                            x_samples_ddim = x_samples_ddim.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+                            out_p = rearrange(x_samples_ddim.squeeze(0).cpu().numpy(), 'c h w -> h w c')
+                            out = (out_p > 0.5)
+
+                        pbar.set_postfix(dict(
+                            label_cls=set(list(label.flatten().astype(int))),
+                            pred_cls=set(list(out.flatten().astype(int)))
+                        ))
+                        prediction = out[:, :, 0]
+
+                        if save_dir is not None:
+                            slice_name = slice_path[0].split("/")[-1]
+                            save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-pred", slice_name.split(".")[-1]]))
+                            save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
+                            save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
+
+                            save_pred = (out*255).astype(np.uint8)
+                            save_logits = (out_p*255).astype(np.uint8)
+                            save_gt = np.expand_dims((label*255).astype(np.uint8), 2).repeat(3, axis=2)
+                            save_cond = ((slice+1)/2*255).astype(np.uint8)
+                            save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
+
+                            Image.fromarray(save_pred).save(save_pred_path)
+                            # Image.fromarray(save_all).save(save_all_path)
+                            # Image.fromarray(save_logits).save(save_logits_path)
+
+                        log_interval = max(1, pbar.total // 8) if pbar.total is not None else 1
+                        if pbar.n % log_interval == 0:
+                            slice_label = np.expand_dims(label, 2).repeat(3, axis=2)
+                            if self.num_classes > 2:
+                                for cls in range(0, self.num_classes):
+                                    encoder_posterior = self.encode_first_stage(
+                                        torch.from_numpy(slice_label == cls).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
+                                    )
+                                    label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
+                                    label_latent_list.append(label_latent)
+                            else:
+                                encoder_posterior = self.encode_first_stage(
+                                    torch.from_numpy(slice_label).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
+                                )
+                                label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
+                                label_latent_list.append(label_latent)
+
+                            samples_latent_list.extend(samples_pred[0:])
+                            label_image_list.append(
+                                torch.from_numpy(colorize(slice_label, num_classes=self.num_classes))
+                                .unsqueeze(0).permute(0, 3, 1, 2))
+                            samples_image_list.append(
+                                torch.from_numpy(colorize(out, num_classes=self.num_classes))
+                                .unsqueeze(0).permute(0, 3, 1, 2))
+                            samples_logits_list.append(torch.from_numpy(out_p * 255).unsqueeze(0).permute(0, 3, 1, 2))
+                            samples_cond_list.append(torch.from_numpy((slice+1)/2*255).unsqueeze(0).permute(0, 3, 1, 2))
+
+                        metrics_list = [[], []]
+                        label = label.round().astype(int)
+                        for idx in range(1, self.num_classes):
+                            metrics_list[0].append(dice_score(prediction == idx, label == idx))
+                            metrics_list[1].append(iou_score(prediction == idx, label == idx))
+                        dice_list += np.array(metrics_list[0])
+                        iou_list += np.array(metrics_list[1])
+                        continue
+
                     assert image.shape == label.shape
                     assert label.max() == self.num_classes-1, label.max()
                     _, x, y, _ = label.shape
@@ -1941,7 +2075,7 @@ class SDSeg(LatentDiffusion):
                             input = torch.from_numpy(slice).unsqueeze(2).unsqueeze(0).repeat((1, 1, 1, 3)).float().cuda()
 
                             c = dict(
-                                c_concat=[self.get_learned_conditioning(prepare_for_first_stage(input))],
+                                c_concat=[self._build_conditioning_latent(input)],
                                 c_crossattn=[None]
                             )
                             samples_pred = list()
@@ -2059,7 +2193,7 @@ class SDSeg(LatentDiffusion):
                         label = label[:, :, 0]
 
                         c = dict(
-                            c_concat=[self.get_learned_conditioning(prepare_for_first_stage(input))],
+                            c_concat=[self._build_conditioning_latent(input)],
                             c_crossattn=[None]
                         )
                         samples_pred = list()
