@@ -1,6 +1,7 @@
 import argparse, os, sys, glob
 
 import torch
+from pathlib import Path
 import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm, trange
@@ -145,6 +146,10 @@ def main():
     # dataset settings
     parser.add_argument("--dataset", type=str,  # '-b' for binary, '-m' for multi
                         help="uses the model trained for given dataset", )
+
+    parser.add_argument("--experiment", type=str,  # '-b' for binary, '-m' for multi
+                        help="define a experiment name to use model checkpoint", )
+    
     # sampling settings
     parser.add_argument("--fixed_code", action='store_true',
                         help="if enabled, uses the same starting code across samples ", )
@@ -164,6 +169,11 @@ def main():
                         help="times of testing for stability evaluation", )
     parser.add_argument("--save_results", action='store_true',  # will slow down inference
                         help="saving the predictions for the whole test set.", )
+
+    parser.add_argument("--use_last_ckpt", action='store_true',  # will slow down inference
+                        help="using the last checkpoint for inference.", )
+    
+
     opt = parser.parse_args()
 
     
@@ -218,13 +228,25 @@ def main():
         dataset = KSEGTest()
     
     elif opt.dataset == "inca":
-        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        run = "2026-01-15T19-46-27_vfss_experiment" 
         print("Evaluate on vfss dataset in binary segmentation manner.")
-        opt.config = glob.glob(os.path.join("logs", run, "configs", "*-project.yaml"))[0]
-        opt.ckpt = f"logs/{run}/checkpoints/epoch=661-step=89999.ckpt"
-        opt.outdir = "outputs/slice2seg-samples-vfss"
-        dataset = VFSSIncaTest()
+        
+        experiment_log_folder = Path("logs") / opt.experiment
+        ckpt_folder = Path(f"logs") / opt.experiment / "checkpoints"
+        
+        opt.config = glob.glob(str(experiment_log_folder / "configs" / "*-project.yaml"))[0]
+        opt.outdir = experiment_log_folder / "metrics" 
+        
+        # dataset = VFSSIncaTest()
+
+    if opt.use_last_ckpt:
+        opt.ckpt = ckpt_folder / "last.ckpt"
+    else:
+        # use the best checkpoint by default
+        checkpoints = glob.glob(os.path.join(ckpt_folder, "*.ckpt"))
+        checkpoints = [ckpt for ckpt in checkpoints if "last.ckpt" not in ckpt]
+        if len(checkpoints) != 1:
+            raise ValueError(f"Expected exactly one checkpoint in {ckpt_folder} other than last.ckpt, but found {len(checkpoints)}")
+        opt.ckpt = checkpoints[0]
     
     # elif opt.dataset == "inca"
     #     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
@@ -235,15 +257,14 @@ def main():
     #     opt.outdir = "outputs/slice2seg-samples-vfss"
     #     dataset = VFSSTest()
     
-    else:
-        raise NotImplementedError(f"Not implement for dataset {opt.dataset}")
-
-    data = DataLoader(dataset, batch_size=opt.n_samples, shuffle=False)
 
     config = OmegaConf.load(f"{opt.config}")
     config["model"]["params"].pop("ckpt_path")
     config["model"]["params"]["cond_stage_config"]["params"].pop("ckpt_path")
     config["model"]["params"]["first_stage_config"]["params"].pop("ckpt_path")
+
+    dataset = instantiate_from_config(config.data.params.test)
+    data = DataLoader(dataset, batch_size=opt.n_samples, shuffle=False)
 
     model, pl_sd = load_model_from_config(config, f"{opt.ckpt}")
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -261,16 +282,20 @@ def main():
         outpath = os.path.join(opt.outdir, str(opt.seed))
         os.makedirs(outpath, exist_ok=True)
 
-        metrics_dict, _ = model.log_dice(data=data, save_dir=outpath) 
+        metrics_dict, _ = model.log_dice(data=data, save_dir=outpath if opt.save_results else None) 
 
         dice_list = metrics_dict["val_avg_dice"]
         iou_list = metrics_dict["val_avg_iou"]
-        print(f"\033[31m[Mean Dice][{opt.dataset}][direct]: {sum(dice_list) / len(dice_list)}\033[0m")
-        print(f"\033[31m[Mean  IoU][{opt.dataset}][direct]: {sum(iou_list) / len(iou_list)}\033[0m")
-        print(f"Just for comparison, i think the result is also is stores on\n Dice: {metrics_dict['val_avg_dice/direct_ema']} IoU: {metrics_dict['val_avg_iou/direct_ema']}")
+        mean_dice = sum(dice_list) / len(dice_list)
+        mean_iou = sum(iou_list) / len(iou_list)
+        print(f"\033[31m[Mean Dice][{opt.dataset}][direct]: {mean_dice}\033[0m")
+        print(f"\033[31m[Mean  IoU][{opt.dataset}][direct]: {mean_iou}\033[0m")
+        
+        # Save metrics to a txt file
+        with open(os.path.join(outpath, "metrics.txt"), "w") as f:
+            f.write(f"Mean Dice (direct): {mean_dice}\n")
+            f.write(f"Mean IoU (direct): {mean_iou}\n")
 
-        print(f"\033[31m[Mean Dice][{opt.dataset}][ddim]: {metrics_dict['val_avg_dice/ddim_ema']}\033[0m")
-        print(f"\033[31m[Mean  IoU][{opt.dataset}][ddim]: {metrics_dict['val_avg_iou/ddim_ema']}\033[0m")
 
         if opt.times > 1:
             print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
