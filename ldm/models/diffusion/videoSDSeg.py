@@ -1485,7 +1485,36 @@ class SDSeg(LatentDiffusion):
                 only_model=False,
             )
 
+    def _as_device_float(self, tensor):
+        return tensor.to(self.device).contiguous().float()
+
+    def _normalize_single_frame_conditioning(self, cond):
+        if cond.shape[1] in [1, 3]:
+            return cond
+        if cond.shape[-1] in [1, 3]:
+            return rearrange(cond, 'b h w c -> b c h w')
+        raise ValueError(f"Unsupported single-frame conditioning shape: {tuple(cond.shape)}")
+
+    def _normalize_temporal_conditioning(self, cond):
+        if cond.shape[1] % 2 == 0:
+            raise ValueError(f"Temporal conditioning requires an odd window size, got {cond.shape[1]}.")
+        if cond.shape[2] in [1, 3]:
+            return cond
+        if cond.shape[-1] in [1, 3]:
+            return rearrange(cond, 'b s h w c -> b s c h w')
+        raise ValueError(f"Unsupported window conditioning shape: {tuple(cond.shape)}")
+
     def _normalize_conditioning_input(self, cond):
+        """Return conditioning as model-ready BCHW or BSCHW plus the center frame.
+
+        Accepted tensor layouts:
+        - HWC or CHW, promoted to one batched frame
+        - BCHW or BHWC
+        - BSCHW or BSHWC, where S is an odd temporal window
+
+        The second return value is the single image that should be logged as the
+        visual conditioning input. For temporal input this is the center frame.
+        """
         if not torch.is_tensor(cond):
             return cond, cond
 
@@ -1493,28 +1522,13 @@ class SDSeg(LatentDiffusion):
             cond = cond.unsqueeze(0)
 
         if cond.ndim == 4:
-            if cond.shape[1] in [1, 3]:
-                cond = cond
-            elif cond.shape[-1] in [1, 3]:
-                cond = rearrange(cond, 'b h w c -> b c h w')
-            else:
-                raise ValueError(f"Unsupported single-frame conditioning shape: {tuple(cond.shape)}")
-
-            cond = cond.to(self.device).contiguous().float()
+            cond = self._normalize_single_frame_conditioning(cond)
+            cond = self._as_device_float(cond)
             return cond, cond
 
         if cond.ndim == 5:
-            if cond.shape[2] in [1, 3]:
-                cond = cond
-            elif cond.shape[-1] in [1, 3]:
-                cond = rearrange(cond, 'b s h w c -> b s c h w')
-            else:
-                raise ValueError(f"Unsupported window conditioning shape: {tuple(cond.shape)}")
-
-            if cond.shape[1] % 2 == 0:
-                raise ValueError(f"Temporal conditioning requires an odd window size, got {cond.shape[1]}.")
-
-            cond = cond.to(self.device).contiguous().float()
+            cond = self._normalize_temporal_conditioning(cond)
+            cond = self._as_device_float(cond)
             return cond, cond[:, cond.shape[1] // 2]
 
         raise ValueError(f"Unsupported conditioning rank: {cond.ndim}")
@@ -1528,18 +1542,20 @@ class SDSeg(LatentDiffusion):
         if cond.ndim == 4:
             return self.get_learned_conditioning(cond)
 
-        num_frames = cond.shape[1]
-        if num_frames == 1:
-            return self.get_learned_conditioning(cond[:, 0])
+        return self._build_temporal_conditioning_latent(cond)
 
-        if self.temporal_context_block is None:
+    def _build_temporal_conditioning_latent(self, cond):
+        num_frames = cond.shape[1] 
+        if num_frames == 1 or self.temporal_context_block is None:
             return self.get_learned_conditioning(cond[:, num_frames // 2])
 
         frame_batch = rearrange(cond, 'b s c h w -> (b s) c h w')
         frame_latents = self.get_learned_conditioning(frame_batch)
         frame_latents = rearrange(frame_latents, '(b s) c h w -> b s c h w', b=cond.shape[0], s=num_frames)
         frame_latents = rearrange(frame_latents, 'b s c h w -> (b s) c h w')
-        return self.temporal_context_block(frame_latents, num_frames)
+        
+        temporal_latents = self.temporal_context_block(frame_latents, num_frames)
+        return temporal_latents
 
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=True):  # modified, only load unet
         """Load weights from a checkpoint.
@@ -1857,534 +1873,452 @@ class SDSeg(LatentDiffusion):
         loss_dict.update({f'{prefix}/loss': loss.item()})
 
         return loss, loss_dict
+
+    def _conditioning_dict(self, conditioning_input, class_id=None):
+        return dict(
+            c_concat=[self._build_conditioning_latent(conditioning_input)],
+            c_crossattn=[class_id],
+        )
+
+    def _conditioning_with_class(self, conditioning, cls):
+        class_id = None if cls is None else torch.tensor([cls], device=self.device)
+        return dict(c_concat=conditioning["c_concat"], c_crossattn=[class_id])
+
+    def _predict_direct_latents(self, conditioning, noise=None):
+        c_latent = conditioning["c_concat"][0]
+        noise = default(noise, lambda: torch.randn_like(c_latent))
+        final_t = torch.full((c_latent.shape[0],), self.num_timesteps - 1, device=self.device).long()
+
+        samples = []
+        classes = range(self.num_classes) if self.num_classes > 2 else [None]
+        for cls in classes:
+            c = self._conditioning_with_class(conditioning, cls)
+            model_output = self.apply_model(noise, final_t, c)
+            samples.append(self.predict_start_from_noise(noise, final_t, noise=model_output))
+        return samples
+
+    def _sample_iterative_latents(self, conditioning, sampler, ddim_steps):
+        samples = []
+        batch_size = conditioning["c_concat"][0].shape[0]
+        classes = range(self.num_classes) if self.num_classes > 2 else [None]
+        for cls in classes:
+            c = self._conditioning_with_class(conditioning, cls)
+            pred, _ = sampler.sample(
+                S=ddim_steps,
+                conditioning=c,
+                shape=(self.channels, self.image_size, self.image_size),
+                batch_size=batch_size,
+                verbose=False,
+                unconditional_guidance_scale=1.0,
+                unconditional_conditioning=None,
+                eta=1.,
+                x_T=None,
+            )
+            samples.append(pred)
+        return samples
+
+    def _predict_segmentation_latents(self, conditioning, sampler, use_direct, ddim_steps, noise=None):
+        if use_direct:
+            return self._predict_direct_latents(conditioning, noise=noise)
+        return self._sample_iterative_latents(conditioning, sampler, ddim_steps)
+
+    def _decode_segmentation_latents(self, samples_pred):
+        if self.num_classes > 2:
+            class_logits = []
+            for cls, sample in enumerate(samples_pred):
+                decoded = self.decode_first_stage(sample)
+                if cls == 0:
+                    decoded = -decoded
+                class_logits.append(decoded.mean(dim=1)[0])
+
+            logits = torch.stack(class_logits, dim=-1)
+            probabilities = logits.softmax(dim=2).detach().cpu().numpy()
+            prediction = probabilities.argmax(axis=2)
+            prediction_rgb = np.repeat(prediction[:, :, None], 3, axis=2)
+            return prediction_rgb, probabilities
+
+        decoded = self.decode_first_stage(samples_pred[0])
+        decoded = torch.clamp((decoded + 1.0) / 2.0, min=0.0, max=1.0)
+        decoded = decoded.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        probabilities = rearrange(decoded.squeeze(0).cpu().numpy(), 'c h w -> h w c')
+        return probabilities > 0.5, probabilities
+
+    @staticmethod
+    def _as_numpy(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return value
+
+    @staticmethod
+    def _ensure_hwc(image):
+        if torch.is_tensor(image):
+            image = image.detach().cpu()
+            if image.ndim == 3 and image.shape[0] in [1, 3]:
+                image = rearrange(image, 'c h w -> h w c')
+            image = image.numpy()
+        if image.ndim == 2:
+            image = np.expand_dims(image, 2).repeat(3, axis=2)
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = image.repeat(3, axis=2)
+        return image
+
+    @staticmethod
+    def _label_to_2d(label):
+        label = SDSeg._as_numpy(label)
+        if label.ndim == 4:
+            label = label[0]
+        if label.ndim == 3 and label.shape[0] in [1, 3]:
+            label = rearrange(label, 'c h w -> h w c')
+        if label.ndim == 3:
+            label = label[:, :, 0]
+        return label
+
+    @staticmethod
+    def _uint8_rgb(image):
+        image = SDSeg._ensure_hwc(image)
+        if image.shape[-1] > 3:
+            image = image[:, :, :3]
+        return np.clip(image, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _unit_or_tanh_to_uint8(image):
+        image = SDSeg._ensure_hwc(image)
+        if image.min() < 0:
+            image = (image + 1.0) / 2.0
+        return np.clip(image * 255.0, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _probabilities_to_uint8(probabilities):
+        probabilities = SDSeg._ensure_hwc(probabilities)
+        if probabilities.shape[-1] > 3:
+            probabilities = probabilities[:, :, :3]
+        return np.clip(probabilities * 255.0, 0, 255).astype(np.uint8)
+
+    def _save_segmentation_result(
+        self,
+        save_dir,
+        slice_name,
+        image,
+        label,
+        prediction,
+        probabilities,
+        suffix="pred",
+        write_pred=True,
+        write_logits=False,
+        write_all=False,
+    ):
+        save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0] + f"-{suffix}", slice_name.split(".")[-1]]))
+        save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0] + "-logits", slice_name.split(".")[-1]]))
+        save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0] + "-all", slice_name.split(".")[-1]]))
+
+        save_pred = self._uint8_rgb(prediction * 255 if self.num_classes == 2 else colorize(prediction, self.num_classes))
+        save_logits = self._probabilities_to_uint8(probabilities)
+        save_gt = self._uint8_rgb(np.expand_dims(label * 255, 2).repeat(3, axis=2))
+        save_cond = self._unit_or_tanh_to_uint8(image)
+        save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
+
+        if write_pred:
+            Image.fromarray(save_pred).save(save_pred_path)
+        if write_logits:
+            Image.fromarray(save_logits).save(save_logits_path)
+        if write_all:
+            Image.fromarray(save_all).save(save_all_path)
+
+    def _label_latents_for_log(self, label):
+        label = label.round().astype(int)
+        if self.num_classes > 2:
+            latents = []
+            for cls in range(self.num_classes):
+                cls_label = np.expand_dims(label == cls, 2).repeat(3, axis=2).astype(np.float32)
+                cls_tensor = torch.from_numpy(cls_label).unsqueeze(0).permute(0, 3, 1, 2).to(self.device)
+                latents.append(self.get_first_stage_encoding(self.encode_first_stage(cls_tensor)).detach())
+            return latents
+
+        label_rgb = np.expand_dims(label, 2).repeat(3, axis=2).astype(np.float32)
+        label_tensor = torch.from_numpy(label_rgb).unsqueeze(0).permute(0, 3, 1, 2).to(self.device)
+        return [self.get_first_stage_encoding(self.encode_first_stage(label_tensor)).detach()]
+
+    def _append_segmentation_log_sample(self, log_state, image, label, prediction, probabilities, samples_pred):
+        label_rgb = np.expand_dims(label, 2).repeat(3, axis=2)
+        log_state["label_latents"].extend(self._label_latents_for_log(label))
+        log_state["sample_latents"].extend(samples_pred)
+        log_state["label_images"].append(
+            torch.from_numpy(colorize(label_rgb, num_classes=self.num_classes)).unsqueeze(0).permute(0, 3, 1, 2)
+        )
+        log_state["sample_images"].append(
+            torch.from_numpy(colorize(prediction, num_classes=self.num_classes)).unsqueeze(0).permute(0, 3, 1, 2)
+        )
+        log_state["sample_logits"].append(
+            torch.from_numpy(self._probabilities_to_uint8(probabilities)).unsqueeze(0).permute(0, 3, 1, 2)
+        )
+        log_state["sample_conditions"].append(
+            torch.from_numpy(self._unit_or_tanh_to_uint8(image)).unsqueeze(0).permute(0, 3, 1, 2)
+        )
+
+    def _segmentation_metrics(self, prediction, label):
+        if prediction.ndim == 3 and label.ndim == 2:
+            prediction = prediction[:, :, 0]
+        elif prediction.ndim == 4 and prediction.shape[-1] in [1, 3]:
+            prediction = prediction[..., 0]
+        label = label.round().astype(int)
+        dice = []
+        iou = []
+        for cls in range(1, self.num_classes):
+            dice.append(dice_score(prediction == cls, label == cls))
+            iou.append(iou_score(prediction == cls, label == cls))
+        return np.array(dice), np.array(iou)
+
+    @staticmethod
+    def _should_log_sample(index, total):
+        interval = max(1, total // 8) if total else 1
+        return index % interval == 0
     
     @torch.no_grad()
     def log_dice(self, data=None, save_dir=None, ddim_steps=50):
-        """Run segmentation inference and compute Dice/IoU metrics.
-
-        This is the main evaluation entry point. It supports three inference
-        styles:
-        - `direct`: one-step prediction from pure noise at the final timestep
-        - `ddim`: iterative DDIM sampling
-        - `plms`: iterative PLMS sampling
-
-        In 2D binary case, the relevant path is:
-        1. encode the input image into the conditioning latent
-        2. generate one segmentation latent prediction
-        3. decode it back to image space
-        4. threshold at `0.5` to obtain a binary mask
-        5. compare foreground class `1` against the ground truth
-        """
-
-        
-        if data is None: # if dataset is not None, means the call comes from inference script.
+        """Run segmentation inference and compute Dice/IoU metrics."""
+        if data is None:
             dataset = self.trainer.datamodule.datasets["validation"]
             data = DataLoader(dataset, batch_size=1, shuffle=False, pin_memory=True)
 
-        # self.model.eval()     # ImageLogger will handle this
         metrics_dict = dict()
         seg_label_dict = dict()
 
+        def make_sampler(name):
+            if name == "plms":
+                return PLMSSampler(self)
+            if name == "ddim":
+                return DDIMSampler(self)
+            if name == "direct":
+                return None
+            raise NotImplementedError(f"Unsupported sampler: {name}")
+
+        def validate_label(label):
+            if label.max() != self.num_classes - 1:
+                raise AssertionError(label.max())
+
+        def infer_slice(conditioning_input, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=None):
+            validate_label(label_2d)
+            conditioning = self._conditioning_dict(conditioning_input)
+            samples_pred = self._predict_segmentation_latents(
+                conditioning=conditioning,
+                sampler=sampler,
+                use_direct=use_direct,
+                ddim_steps=ddim_steps,
+                noise=noise,
+            )
+            prediction, probabilities = self._decode_segmentation_latents(samples_pred)
+            dice, iou = self._segmentation_metrics(prediction, label_2d)
+            return prediction, probabilities, samples_pred, dice, iou
+
+        def finalize_logs(log_state):
+            try:
+                return [
+                    self.prepare_latent_to_log(
+                        torch.cat((
+                            torch.cat(log_state["sample_latents"], dim=0),
+                            torch.cat(log_state["label_latents"], dim=0)),
+                            dim=1).float()
+                    ),
+                    (torch.cat((
+                        torch.cat(log_state["sample_logits"], dim=3),
+                        torch.cat(log_state["sample_images"], dim=3),
+                        torch.cat(log_state["label_images"], dim=3),
+                        torch.cat(log_state["sample_conditions"], dim=3),),
+                        dim=2) / 255. * 2.).float() - 1.,
+                ]
+            except (NotImplementedError, RuntimeError):
+                return [list(), list()]
+
         def get_dice(data, used_sampler="ddim", save_dir=None, ddim_steps=50):
-            """Select a sampler, run inference, and return aggregate metrics.
-            
-             Args:
-                used_sampler: "direct", "ddim", "plms" ( "direct" -> self.predict_start_from_noise() )
-
-            Returns:
-                return ema_dice_list
-
-            """
+            sampler = make_sampler(used_sampler)
+            use_direct = used_sampler == "direct"
 
             def get_dice_loop(data, sampler, use_direct=False, noise=None, save_dir=None, ddim_steps=50):
-                """Inner validation loop shared by the available samplers.
+                dice_sum = np.zeros(self.num_classes - 1, dtype=float)
+                iou_sum = np.zeros(self.num_classes - 1, dtype=float)
+                log_state = dict(
+                    label_latents=[],
+                    sample_latents=[],
+                    label_images=[],
+                    sample_images=[],
+                    sample_logits=[],
+                    sample_conditions=[],
+                )
 
-                Responsibilities of this helper:
-                - iterate over the validation set
-                - turn each input image (or slice) into conditioning latents
-                - predict a segmentation latent either directly or with a sampler
-                - decode the latent back into mask/logit images
-                - accumulate Dice/IoU statistics
-                - optionally store debug visualizations and logging tensors
-
-                For binary 2D images:
-                - `samples_pred[0]` is the only latent prediction used
-                - the decoded mask is mapped from `[-1, 1]` to `[0, 1]`
-                - channels are averaged and thresholded at `0.5`
-                """
-                dice_list = 0.
-                iou_list = 0.
-                label_latent_list, samples_latent_list, cond_latent_list = list(), list(), list()
-                label_image_list, samples_image_list = list(), list()
-                samples_logits_list, samples_cond_list = list(), list()
-                pbar = tqdm(data, desc="Validating Segmentation")   # volume-wise
-                for prompts in pbar:
+                pbar = tqdm(data, desc="Validating Segmentation")
+                for item_idx, prompts in enumerate(pbar):
                     slice_path = prompts["file_path_"]
-                    image = prompts["image"]  # 1 256 256 3  (1, H, W, D)
-                    label = prompts["segmentation"]  # 1 256 256 3  (1, H, W, D)
+                    image = prompts["image"]
+                    label = prompts["segmentation"]
 
-                    is_vfss_window_batch = (
-                        torch.is_tensor(image) and image.ndim == 5 and
-                        torch.is_tensor(label) and label.ndim in [3, 4]
-                    )
-                    is_vfss_single_frame_batch = (
-                        torch.is_tensor(image) and image.ndim == 4 and image.shape[-1] in [1, 3] and
-                        torch.is_tensor(label) and label.ndim in [3, 4]
+                    is_vfss_batch = (
+                        torch.is_tensor(image)
+                        and (
+                            image.ndim == 5
+                            or (
+                                image.ndim == 4
+                                and (image.shape[1] in [1, 3] or image.shape[-1] in [1, 3])
+                            )
+                        )
+                        and torch.is_tensor(label)
+                        and label.ndim in [3, 4]
                     )
 
-                    if is_vfss_window_batch or is_vfss_single_frame_batch:
+                    if is_vfss_batch:
                         if image.shape[0] != 1:
                             raise ValueError("log_dice currently expects batch_size=1 for VFSS validation.")
 
-                        c_latent = self._build_conditioning_latent(image)
-                        c = dict(c_concat=[c_latent], c_crossattn=[None])
-
-                        if is_vfss_window_batch:
-                            center_image = image[:, image.shape[1] // 2]
-                            slice = rearrange(center_image[0].detach().cpu(), 'c h w -> h w c').numpy()
-                        else:
-                            slice = image[0].detach().cpu().numpy()
-
-                        label_np = label[0].detach().cpu().numpy() if label.ndim == 4 else label.detach().cpu().numpy()
-                        if label_np.ndim == 3 and label_np.shape[0] in [1, 3]:
-                            label_np = rearrange(label_np, 'c h w -> h w c')
-                        label = label_np[:, :, 0] if label_np.ndim == 3 else label_np
-                        assert label.max() == self.num_classes - 1, label.max()
-
-                        samples_pred = list()
-                        if use_direct:
-                            noise = default(noise, lambda: torch.randn_like(c["c_concat"][0]))
-                            final_t = torch.tensor([self.num_timesteps - 1], device=self.device).long()
-                            if self.num_classes > 2:
-                                for cls in range(0, self.num_classes):
-                                    c["c_crossattn"] = [torch.tensor([cls], device=self.device)]
-                                    model_output = self.apply_model(noise, final_t, c)
-                                    pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                    samples_pred.append(pred_tmp)
-                            else:
-                                model_output = self.apply_model(noise, final_t, c)
-                                pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                samples_pred.append(pred_tmp)
-                        else:
-                            pred_tmp, _ = sampler.sample(
-                                S=ddim_steps,
-                                conditioning=c,
-                                shape=(self.channels, self.image_size, self.image_size),
-                                batch_size=1,
-                                verbose=False,
-                                unconditional_guidance_scale=1.0,
-                                unconditional_conditioning=None,
-                                eta=1.,
-                                x_T=None
-                            )
-                            samples_pred.append(pred_tmp)
-
-                        out = torch.zeros((256, 256, self.num_classes))
-                        if self.num_classes > 2:
-                            for cls in range(0, self.num_classes):
-                                x_samples_ddim = self.decode_first_stage(samples_pred[cls])
-                                if cls == 0:
-                                    x_samples_ddim *= -1
-                                x_samples_ddim = torch.mean(x_samples_ddim, dim=1, keepdim=False)
-                                out[:, :, cls] = x_samples_ddim[0, ...]
-                            out_p = out.softmax(dim=2)
-                            out = out_p.argmax(dim=2, keepdim=True).repeat(1, 1, 3).numpy()
-                        else:
-                            x_samples_ddim = self.decode_first_stage(samples_pred[0])
-                            x_samples_ddim = torch.clamp(
-                                (x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0
-                            )
-                            x_samples_ddim = x_samples_ddim.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-                            out_p = rearrange(x_samples_ddim.squeeze(0).cpu().numpy(), 'c h w -> h w c')
-                            out = (out_p > 0.5)
+                        normalized_image, center_image = self._normalize_conditioning_input(image)
+                        image_for_log = self._ensure_hwc(center_image[0])
+                        label_2d = self._label_to_2d(label)
+                        prediction, probabilities, samples_pred, dice, iou = infer_slice(
+                            normalized_image, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=noise
+                        )
 
                         pbar.set_postfix(dict(
-                            label_cls=set(list(label.flatten().astype(int))),
-                            pred_cls=set(list(out.flatten().astype(int)))
+                            label_cls=set(list(label_2d.flatten().astype(int))),
+                            pred_cls=set(list(prediction.flatten().astype(int))),
                         ))
-                        prediction = out[:, :, 0]
 
                         if save_dir is not None:
                             slice_name = slice_path[0].split("/")[-1]
-                            save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-pred", slice_name.split(".")[-1]]))
-                            save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
-                            save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
+                            self._save_segmentation_result(
+                                save_dir, slice_name, image_for_log, label_2d,
+                                prediction, probabilities, suffix="pred",
+                            )
 
-                            save_pred = (out*255).astype(np.uint8)
-                            save_logits = (out_p*255).astype(np.uint8)
-                            save_gt = np.expand_dims((label*255).astype(np.uint8), 2).repeat(3, axis=2)
-                            save_cond = ((slice+1)/2*255).astype(np.uint8)
-                            save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
+                        if self._should_log_sample(item_idx, pbar.total):
+                            self._append_segmentation_log_sample(
+                                log_state, image_for_log, label_2d, prediction, probabilities, samples_pred
+                            )
 
-                            Image.fromarray(save_pred).save(save_pred_path)
-                            # Image.fromarray(save_all).save(save_all_path)
-                            # Image.fromarray(save_logits).save(save_logits_path)
-
-                        log_interval = max(1, pbar.total // 8) if pbar.total is not None else 1
-                        if pbar.n % log_interval == 0:
-                            slice_label = np.expand_dims(label, 2).repeat(3, axis=2)
-                            if self.num_classes > 2:
-                                for cls in range(0, self.num_classes):
-                                    encoder_posterior = self.encode_first_stage(
-                                        torch.from_numpy(slice_label == cls).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                    )
-                                    label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                    label_latent_list.append(label_latent)
-                            else:
-                                encoder_posterior = self.encode_first_stage(
-                                    torch.from_numpy(slice_label).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                )
-                                label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                label_latent_list.append(label_latent)
-
-                            samples_latent_list.extend(samples_pred[0:])
-                            label_image_list.append(
-                                torch.from_numpy(colorize(slice_label, num_classes=self.num_classes))
-                                .unsqueeze(0).permute(0, 3, 1, 2))
-                            samples_image_list.append(
-                                torch.from_numpy(colorize(out, num_classes=self.num_classes))
-                                .unsqueeze(0).permute(0, 3, 1, 2))
-                            samples_logits_list.append(torch.from_numpy(out_p * 255).unsqueeze(0).permute(0, 3, 1, 2))
-                            samples_cond_list.append(torch.from_numpy((slice+1)/2*255).unsqueeze(0).permute(0, 3, 1, 2))
-
-                        metrics_list = [[], []]
-                        label = label.round().astype(int)
-                        for idx in range(1, self.num_classes):
-                            metrics_list[0].append(dice_score(prediction == idx, label == idx))
-                            metrics_list[1].append(iou_score(prediction == idx, label == idx))
-                        dice_list += np.array(metrics_list[0])
-                        iou_list += np.array(metrics_list[1])
+                        dice_sum += dice
+                        iou_sum += iou
                         continue
 
-                    assert image.shape == label.shape
-                    assert label.max() == self.num_classes-1, label.max()
-                    _, x, y, _ = label.shape
-                    image = torch.from_numpy(zoom(image, (1, 256 / x, 256 / y, 1), order=1))
-                    label = torch.from_numpy(zoom(label, (1, 256 / x, 256 / y, 1), order=0))
-                    # print(image.device, image.shape, label.device, label.shape)
+                    image_np = self._as_numpy(image)
+                    label_np = self._as_numpy(label)
+                    if image_np.shape != label_np.shape:
+                        raise AssertionError((image_np.shape, label_np.shape))
+                    validate_label(label_np)
+
+                    _, original_h, original_w, _ = label_np.shape
+                    image_np = zoom(image_np, (1, 256 / original_h, 256 / original_w, 1), order=1)
+                    label_np = zoom(label_np, (1, 256 / original_h, 256 / original_w, 1), order=0)
                     volume_name = slice_path[0].split("/")[-1].split("_")[0]
-                    image, label = image.squeeze(0).numpy(), label.squeeze(0).numpy()
-                    prediction = np.zeros_like(image)   
+                    image_np = image_np.squeeze(0)
+                    label_np = label_np.squeeze(0)
 
-                    if image.shape[-1] > 3:     # for gray-scale 3D dataset inference
-                        # prediction = np.zeros_like(image)   # 256 256
-                        pbar_sub = tqdm(iterable=range(image.shape[2]), desc=f"[Inferring volume {volume_name.split('.')[0]}]")
-                        for idx in range(image.shape[2]):
-                            slice = image[:, :, idx]    # 256 256
-                            slice_label = label[:, :, idx]  # H W
-                            input = torch.from_numpy(slice).unsqueeze(2).unsqueeze(0).repeat((1, 1, 1, 3)).float().cuda()
-
-                            c = dict(
-                                c_concat=[self._build_conditioning_latent(input)],
-                                c_crossattn=[None]
+                    if image_np.shape[-1] > 3:
+                        prediction_volume = np.zeros_like(image_np)
+                        pbar_sub = tqdm(
+                            iterable=range(image_np.shape[2]),
+                            desc=f"[Inferring volume {volume_name.split('.')[0]}]",
+                        )
+                        for slice_idx in pbar_sub:
+                            image_slice = image_np[:, :, slice_idx]
+                            label_slice = label_np[:, :, slice_idx]
+                            conditioning_input = (
+                                torch.from_numpy(image_slice)
+                                .unsqueeze(2)
+                                .unsqueeze(0)
+                                .repeat((1, 1, 1, 3))
+                                .float()
+                                .to(self.device)
                             )
-                            samples_pred = list()
-                            if use_direct:
-                                noise = default(noise, lambda: torch.randn_like(c["c_concat"][0]))
-                                final_t = torch.tensor([self.num_timesteps - 1], device=self.device).long()
-                                if self.num_classes > 2:    # multi class segmentation
-                                    for cls in range(0, self.num_classes):  # predict once for each class
-                                        c["c_crossattn"] = [torch.tensor([cls], device=self.device)]   # cls_id
-                                        model_output = self.apply_model(noise, final_t, c)
-                                        pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                        samples_pred.append(pred_tmp)
-                                else:
-                                    model_output = self.apply_model(noise, final_t, c)
-                                    pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                    samples_pred.append(pred_tmp)
-                            else:
-                                # for cls in range(0, self.num_classes):
-                                #     c["c_crossattn"] = [torch.tensor([cls], device=self.device)]
-                                pred_tmp, _ = sampler.sample(
-                                    S=ddim_steps,
-                                    conditioning=c,
-                                    shape=(self.channels, self.image_size, self.image_size),
-                                    batch_size=1,
-                                    verbose=False,
-                                    unconditional_guidance_scale=1.0,  # CT slice takes control
-                                    unconditional_conditioning=None,  # dont need unconditional result
-                                    eta=1.,
-                                    x_T=None
-                                )
-                                samples_pred.append(pred_tmp)
+                            image_for_log = np.expand_dims(image_slice, 2).repeat(3, axis=2)
 
-                            out = torch.zeros((256, 256, self.num_classes))     # h w num_classes
-                            if self.num_classes > 2:
-                                for cls in range(0, self.num_classes):
-                                    x_samples_ddim = self.decode_first_stage(samples_pred[cls])
-                                    if cls == 0:
-                                        x_samples_ddim *= -1    # for softmax
-                                    x_samples_ddim = torch.mean(x_samples_ddim, dim=1, keepdim=False)    # b h w
-                                    out[:, :, cls] = x_samples_ddim[0, ...]
-                                out_p = out.softmax(dim=2)
-                                out = out.softmax(dim=2).argmax(dim=2, keepdim=True).repeat(1, 1, 3).numpy()    # h w c==3
-                            else:
-                                x_samples_ddim = self.decode_first_stage(samples_pred[0])
-                                x_samples_ddim = torch.clamp(
-                                    (x_samples_ddim + 1.0) / 2.0 , min=0.0, max=1.0
-                                )  # [-1, 1] -> [0, 13 or 255]     (b, c, h, w)
-                                # channel-wise average, can not use for colored mode:
-                                x_samples_ddim = x_samples_ddim.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-                                out_p = rearrange(x_samples_ddim.squeeze(0).cpu().numpy(), 'c h w -> h w c')
-                                out = (out_p > 0.5)
+                            prediction, probabilities, samples_pred, dice, iou = infer_slice(
+                                conditioning_input, image_for_log, label_slice, sampler, use_direct, ddim_steps, noise=noise
+                            )
+                            prediction_volume[:, :, slice_idx] = prediction[:, :, 0]
                             pbar_sub.set_postfix(dict(
-                                label_cls=set(list(slice_label.flatten().astype(int))),
-                                pred_cls=set(list(out.flatten().astype(int)))
-                            )
-                            )
-                            prediction[:, :, idx] = out[:, :, 0]
+                                label_cls=set(list(label_slice.flatten().astype(int))),
+                                pred_cls=set(list(prediction.flatten().astype(int))),
+                            ))
 
                             if save_dir is not None:
-                                slice_name = slice_path[0].split("/")[-1].split(".")[0] + f"_{idx}" + ".png"  # ori: .nii.gz
-                                save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-gts", slice_name.split(".")[-1]]))
-                                save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
-                                save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
-                                
-                                save_pred = (out*255).astype(np.uint8)
-                                save_logits = (out_p*255).astype(np.uint8)
-                                save_gt = np.expand_dims((slice_label*255), 2).repeat(3, axis=2).astype(np.uint8)
-                                save_cond = np.expand_dims((slice+1)/2*255, 2).repeat(3, axis=2).astype(np.uint8)
-                                save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
-                                
-                                # WARNING: only *-all.png == exact test set size, the others only have size of non-empty slices. 
-                                if slice_label.max() > 0:
-                                    Image.fromarray(save_pred).save(save_pred_path)
-                                    Image.fromarray(save_logits).save(save_logits_path)
-                                Image.fromarray(save_all).save(save_all_path)
+                                slice_name = slice_path[0].split("/")[-1].split(".")[0] + f"_{slice_idx}.png"
+                                has_foreground = label_slice.max() > 0
+                                self._save_segmentation_result(
+                                    save_dir, slice_name, image_for_log, label_slice,
+                                    prediction, probabilities, suffix="gts",
+                                    write_pred=has_foreground,
+                                    write_logits=has_foreground,
+                                    write_all=True,
+                                )
 
-
-                            # # log non-empty examples for debugging
-                            if idx % (image.shape[2] // 8) == 0:
-                                slice_label = np.expand_dims(slice_label, 2).repeat(3, axis=2)  # H W C
-                                # slice_label = zoom(slice_label, (256 / x, 256 / y, 1), order=0)
-                                if self.num_classes > 2:
-                                    for cls in range(0, self.num_classes):
-                                        encoder_posterior = self.encode_first_stage(
-                                            torch.from_numpy(slice_label == cls).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                        )
-                                        label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                        label_latent_list.append(label_latent)  # 1 4 32 32
-                                else:
-                                    encoder_posterior = self.encode_first_stage(
-                                        torch.from_numpy(slice_label).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                    )
-                                    label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                    label_latent_list.append(label_latent)  # 1 4 32 32
-                                    
-                                samples_latent_list.extend(samples_pred[0:])    # 1 4 32 32
-                                label_image_list.append(
-                                    torch.from_numpy(colorize(slice_label, num_classes=self.num_classes))
-                                    .unsqueeze(0).permute(0, 3, 1, 2))    # 1 3 256 256
-                                samples_image_list.append(
-                                    torch.from_numpy(colorize(out, num_classes=self.num_classes))
-                                    .unsqueeze(0).permute(0, 3, 1, 2))  # 1 3 256 256
-                                
-                                samples_logits_list.append(torch.from_numpy(out_p * 255).unsqueeze(0).permute(0, 3, 1, 2))
-                                samples_cond_list.append(torch.from_numpy((slice+1)/2*255).unsqueeze(0).unsqueeze(1).repeat((1, 3, 1, 1)))
-
-                            pbar_sub.update()
+                            if self._should_log_sample(slice_idx, image_np.shape[2]):
+                                self._append_segmentation_log_sample(
+                                    log_state, image_for_log, label_slice, prediction, probabilities, samples_pred
+                                )
                         pbar_sub.close()
 
-                    else:   # for 2D slices inference
-                        # This is the branch used by a standard 2D binary dataset:
-                        # one image -> one latent prediction -> one decoded mask.
-                        slice = image
-                        input = torch.from_numpy(image).unsqueeze(0).float().cuda()
-                        label = label[:, :, 0]
-
-                        c = dict(
-                            c_concat=[self._build_conditioning_latent(input)],
-                            c_crossattn=[None]
+                        volume_dice, volume_iou = self._segmentation_metrics(prediction_volume, label_np)
+                        dice_sum += volume_dice
+                        iou_sum += volume_iou
+                    else:
+                        image_for_log = image_np
+                        label_2d = label_np[:, :, 0]
+                        conditioning_input = torch.from_numpy(image_np).unsqueeze(0).float().to(self.device)
+                        prediction, probabilities, samples_pred, dice, iou = infer_slice(
+                            conditioning_input, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=noise
                         )
-                        samples_pred = list()
-                        if use_direct:
-                            noise = default(noise, lambda: torch.randn_like(c["c_concat"][0]))
-                            final_t = torch.tensor([self.num_timesteps - 1], device=self.device).long()
-                            if self.num_classes > 2:    # multi class segmentation
-                                for cls in range(0, self.num_classes):  # predict once for each class
-                                    c["c_crossattn"] = [torch.tensor([cls], device=self.device)]   # cls_id
-                                    model_output = self.apply_model(noise, final_t, c)
-                                    pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                    samples_pred.append(pred_tmp)
-                            else:
-                                model_output = self.apply_model(noise, final_t, c)
-                                pred_tmp = self.predict_start_from_noise(noise, final_t, noise=model_output)
-                                samples_pred.append(pred_tmp)
-                        else:
-                            # for cls in range(0, self.num_classes):
-                            #     c["c_crossattn"] = [torch.tensor([cls], device=self.device)]
-                            pred_tmp, _ = sampler.sample(
-                                S=ddim_steps,
-                                conditioning=c,
-                                shape=(self.channels, self.image_size, self.image_size),
-                                batch_size=1,
-                                verbose=False,
-                                unconditional_guidance_scale=1.0,  # CT slice takes control
-                                unconditional_conditioning=None,  # dont need unconditional result
-                                eta=1.,
-                                x_T=None
-                            )
-                            samples_pred.append(pred_tmp)
-
-                        out = torch.zeros((256, 256, self.num_classes))     # h w num_classes
-                        if self.num_classes > 2:
-                            for cls in range(0, self.num_classes):
-                                x_samples_ddim = self.decode_first_stage(samples_pred[cls])
-                                if cls == 0:
-                                    x_samples_ddim *= -1    # for softmax
-                                x_samples_ddim = torch.mean(x_samples_ddim, dim=1, keepdim=False)    # b h w
-                                out[:, :, cls] = x_samples_ddim[0, ...]
-                            out_p = out.softmax(dim=2)
-                            out = out_p.argmax(dim=2, keepdim=True).repeat(1, 1, 3).numpy()    # h w c==3
-                        else:
-                            # Binary segmentation path:
-                            # decode the latent mask, rescale to [0, 1], average the
-                            # output channels, then threshold to obtain foreground/background.
-                            x_samples_ddim = self.decode_first_stage(samples_pred[0])
-                            x_samples_ddim = torch.clamp(
-                                (x_samples_ddim + 1.0) / 2.0 , min=0.0, max=1.0
-                            )  
-                            # x_samples_ddim = (x_samples_ddim + 1.0) / 2.0
-                            # channel-wise average, can not use for colored mode:
-                            x_samples_ddim = x_samples_ddim.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-                            out_p = rearrange(x_samples_ddim.squeeze(0).cpu().numpy(), 'c h w -> h w c')
-                            out = (out_p > 0.5)
                         pbar.set_postfix(dict(
-                            label_cls=set(list(label.flatten().astype(int))),
-                            pred_cls=set(list(out.flatten().astype(int)))
-                        )
-                        )
-                        prediction = out[:, :, 0]
+                            label_cls=set(list(label_2d.flatten().astype(int))),
+                            pred_cls=set(list(prediction.flatten().astype(int))),
+                        ))
 
                         if save_dir is not None:
                             slice_name = slice_path[0].split("/")[-1]
-                            save_pred_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-pred", slice_name.split(".")[-1]]))
-                            save_logits_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-logits", slice_name.split(".")[-1]]))
-                            save_all_path = os.path.join(save_dir, ".".join([slice_name.split(".")[0]+"-all", slice_name.split(".")[-1]]))
-                            
-                            save_pred = (out*255).astype(np.uint8)
-                            save_logits = (out_p*255).astype(np.uint8)
-                            save_gt = np.expand_dims((label*255).astype(np.uint8), 2).repeat(3, axis=2)
-                            save_cond = ((slice+1)/2*255).astype(np.uint8)
-                            save_all = np.concatenate((save_cond, save_gt, save_pred, save_logits), axis=1)
-                            
-                            Image.fromarray(save_pred).save(save_pred_path)
-                            # Image.fromarray(save_all).save(save_all_path)
-                            # Image.fromarray(save_logits).save(save_logits_path)
-                            
+                            self._save_segmentation_result(
+                                save_dir, slice_name, image_for_log, label_2d,
+                                prediction, probabilities, suffix="pred",
+                            )
 
-                        # log non-empty examples for debugging
-                        if  pbar.n % (pbar.total // 8) == 0:
-                            slice_label = np.expand_dims(label, 2).repeat(3, axis=2)  # H W C
-                            # slice_label = zoom(slice_label, (256 / x, 256 / y, 1), order=0)
-                            if self.num_classes > 2:
-                                for cls in range(0, self.num_classes):
-                                    encoder_posterior = self.encode_first_stage(
-                                        torch.from_numpy(label == cls).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                    )
-                                    label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                    label_latent_list.append(label_latent)  # 1 4 32 32
-                            else:
-                                encoder_posterior = self.encode_first_stage(
-                                    torch.from_numpy(slice_label).unsqueeze(0).permute((0, 3, 1, 2)).half().cuda()
-                                )
-                                label_latent = self.get_first_stage_encoding(encoder_posterior).detach()
-                                label_latent_list.append(label_latent)  # 1 4 32 32
-                                
-                            samples_latent_list.extend(samples_pred[0:])    # 1 4 32 32
-                            label_image_list.append(
-                                torch.from_numpy(colorize(slice_label, num_classes=self.num_classes))
-                                .unsqueeze(0).permute(0, 3, 1, 2))    # 1 3 256 256
-                            samples_image_list.append(
-                                torch.from_numpy(colorize(out, num_classes=self.num_classes))
-                                .unsqueeze(0).permute(0, 3, 1, 2))  # 1 3 256 256
-                            
-                            samples_logits_list.append(torch.from_numpy(out_p * 255).unsqueeze(0).permute(0, 3, 1, 2))
-                            samples_cond_list.append(torch.from_numpy((slice+1)/2*255).unsqueeze(0).permute(0, 3, 1, 2))
+                        if self._should_log_sample(item_idx, pbar.total):
+                            self._append_segmentation_log_sample(
+                                log_state, image_for_log, label_2d, prediction, probabilities, samples_pred
+                            )
 
-                    # prediction = zoom(prediction, (x / 256, y / 256), order=0)   # H W
-                    # label = zoom(label, (x / 256, y / 256), order=0)   # H W
-                            
-                    metrics_list = [[], []]
-                    label = label.round().astype(int)
-                    for idx in range(1, self.num_classes):
-                        metrics_list[0].append(dice_score(prediction == idx, label == idx))
-                        metrics_list[1].append(iou_score(prediction == idx, label == idx))
-                    dice_list += np.array(metrics_list[0])
-                    iou_list += np.array(metrics_list[1])
+                        dice_sum += dice
+                        iou_sum += iou
                 pbar.close()
 
-                try:
-                    seg_label_pair = [
-                        self.prepare_latent_to_log(
-                            torch.cat((
-                                torch.cat(samples_latent_list, dim=0),
-                                torch.cat(label_latent_list, dim=0)),
-                                dim=1).float()
-                        ),
-                            (torch.cat((
-                                torch.cat(samples_logits_list, dim=3),
-                                torch.cat(samples_image_list, dim=3),
-                                torch.cat(label_image_list, dim=3),
-                                torch.cat(samples_cond_list, dim=3),),
-                                dim=2)/255.*2.).float()-1.
-                        ]
-                except NotImplementedError:     # inference stage doesn't log
-                    seg_label_pair = [list(), list()]
+                dice_mean = dice_sum / len(data)
+                iou_mean = iou_sum / len(data)
+                for cls in range(1, self.num_classes):
+                    print(f"\033[31m[Mean Dice][cls {cls}]: {dice_mean[cls - 1]}\033[0m")
+                    print(f"\033[31m[Mean  IoU][cls {cls}]: {iou_mean[cls - 1]}\033[0m")
 
-                dice_list = dice_list / len(data)
-                for idx in range(1, self.num_classes):
-                    print(f"\033[31m[Mean Dice][cls {idx}]: {dice_list[idx-1]}\033[0m")
-
-                iou_list = iou_list / len(data)
-                for idx in range(1, self.num_classes):
-                    print(f"\033[31m[Mean  IoU][cls {idx}]: {iou_list[idx-1]}\033[0m")
-
-                return dice_list, iou_list, seg_label_pair
-
-            if used_sampler == "plms":
-                sampler = PLMSSampler(self)
-            elif used_sampler == "ddim":
-                sampler = DDIMSampler(self)
-            elif used_sampler == "direct":
-                sampler = None
-            else:
-                raise NotImplementedError()
+                return dice_mean, iou_mean, finalize_logs(log_state)
 
             precision_scope = autocast
             with torch.no_grad():
                 with precision_scope("cuda"):
                     with self.ema_scope(f"EMA Seg Validation ({used_sampler})"):
-                        ema_dice_list, ema_iou_list, seg_label_pair = get_dice_loop(data, sampler,
-                                                           use_direct=True if used_sampler == "direct" else False,
-                                                           save_dir=save_dir, ddim_steps=ddim_steps)
-            return ema_dice_list, ema_iou_list, seg_label_pair
+                        return get_dice_loop(
+                            data,
+                            sampler,
+                            use_direct=use_direct,
+                            save_dir=save_dir,
+                            ddim_steps=ddim_steps,
+                        )
 
-        # try dice methods
         ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="direct", save_dir=save_dir)
         multi_dice, multi_iou = np.array(ema_dice), np.array(ema_iou)
         metrics_dict.update({"val_avg_dice/direct_ema": np.mean(multi_dice)})
         metrics_dict.update({"val_avg_iou/direct_ema": np.mean(multi_iou)})
         for cls in range(1, self.num_classes):
-            metrics_dict.update({f"val_avg_dice/direct_ema_{cls}": multi_dice[cls-1]})
-        for cls in range(1, self.num_classes):
-            metrics_dict.update({f"val_avg_iou/direct_ema_{cls}": multi_iou[cls-1]})
-        seg_label_dict.update({"latent_seg_label-direct_ema": seg_label_pair[0],
-                               "image_seg_label-direct-ema": seg_label_pair[1]})
-        
-        # print("ddim steps: ", ddim_steps)
-        # ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="ddim", save_dir=save_dir, ddim_steps=ddim_steps)
-        # metrics_dict.update({"val_avg_dice/ddim_ema": np.mean(np.array(ema_dice))})
-        # metrics_dict.update({"val_avg_iou/ddim_ema": np.mean(np.array(ema_iou))})
-        # seg_label_dict.update({"latent_seg_label-ddim_ema": seg_label_pair[0],
-        #                     "image_seg_label-ddim-ema": seg_label_pair[1]})
+            metrics_dict.update({f"val_avg_dice/direct_ema_{cls}": multi_dice[cls - 1]})
+            metrics_dict.update({f"val_avg_iou/direct_ema_{cls}": multi_iou[cls - 1]})
+        seg_label_dict.update({
+            "latent_seg_label-direct_ema": seg_label_pair[0],
+            "image_seg_label-direct-ema": seg_label_pair[1],
+        })
 
-
-        # choose one as the segmentation monitor
         metrics_dict.update({"val_avg_dice": list(multi_dice)})
         metrics_dict.update({"val_avg_iou": list(multi_iou)})
-
-        # self.model.train()    # ImageLogger will handle this
         return metrics_dict, seg_label_dict
 
     @staticmethod
