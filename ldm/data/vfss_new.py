@@ -29,6 +29,7 @@ class VFSSWindowImageDataset(Dataset):
                  image_interpolation="bilinear",
                  mask_interpolation="nearest",
                  split=None,
+                 target_folder='target',
                  **kwargs
                 ):
         '''
@@ -42,6 +43,7 @@ class VFSSWindowImageDataset(Dataset):
             target_transform (callable, optional): Transformação a ser aplicada à mascara.
             repeat_channels (bool): Se True, repete os canais das imagens em escala de cinza para criar imagens RGB.
             split (str, optional): O split do dataset a ser carregado (e.g., 'train', 'val', 'test'). Se None, carrega todo o dataset.
+            target_folder (str): Nome da pasta onde os alvos estão armazenados.
         '''
 
         self.dataset_path = Path(dataset_path)
@@ -76,6 +78,23 @@ class VFSSWindowImageDataset(Dataset):
             self.target_transform = T.Resize(
                 self.image_size, interpolation=self.mask_interpolation
             )
+
+        # get folder path of target_path
+        current_target_folder = os.path.dirname(self.video_frame_df['target_path'].iloc[0])
+        split_folder = os.path.dirname(current_target_folder)
+
+        existing_target_folders = os.listdir(self.__resolve_path(split_folder))
+        if target_folder in existing_target_folders:
+            new_target_folder = os.path.join(split_folder, target_folder)
+
+            if new_target_folder != current_target_folder:
+                logger.info(f"Updating target paths to use target folder '{target_folder}' instead of '{current_target_folder}'")
+                self.video_frame_df['target_path'] = self.video_frame_df['target_path'].str.replace(current_target_folder, new_target_folder)
+
+        else: 
+            raise ValueError(f"Target folder '{target_folder}' not found in the dataset. Existing target folders: {existing_target_folders}")
+
+        
 
         self.rows = self.video_frame_df.to_dict("records")
 
