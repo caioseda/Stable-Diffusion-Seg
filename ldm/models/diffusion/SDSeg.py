@@ -1759,6 +1759,134 @@ class SDSeg(LatentDiffusion):
 
         return loss, loss_dict
     
+    def _classic_conditioning_dict(self, image):
+        if image.ndim != 4:
+            raise ValueError(f"Classic SDSeg expects a 4D image batch, got {tuple(image.shape)}.")
+        if image.shape[1] in [1, 3]:
+            conditioning_input = image
+        else:
+            conditioning_input = rearrange(image, 'b h w c -> b c h w')
+        conditioning_input = conditioning_input.to(self.device).float()
+        return dict(
+            c_concat=[self.get_learned_conditioning(conditioning_input)],
+            c_crossattn=[None],
+        )
+
+    def _predict_classic_latents(self, conditioning, sampler=None, use_direct=True, ddim_steps=50, noise=None):
+        samples_pred = []
+        if use_direct:
+            c_latent = conditioning["c_concat"][0]
+            noise = default(noise, lambda: torch.randn_like(c_latent))
+            final_t = torch.full((c_latent.shape[0],), self.num_timesteps - 1, device=self.device).long()
+            classes = range(self.num_classes) if self.num_classes > 2 else [None]
+            for cls in classes:
+                c = dict(c_concat=conditioning["c_concat"], c_crossattn=[None])
+                if cls is not None:
+                    c["c_crossattn"] = [torch.tensor([cls], device=self.device)]
+                model_output = self.apply_model(noise, final_t, c)
+                samples_pred.append(self.predict_start_from_noise(noise, final_t, noise=model_output))
+            return samples_pred
+
+        if sampler is None:
+            raise ValueError("A sampler is required when use_direct=False.")
+        pred, _ = sampler.sample(
+            S=ddim_steps,
+            conditioning=conditioning,
+            shape=(self.channels, self.image_size, self.image_size),
+            batch_size=conditioning["c_concat"][0].shape[0],
+            verbose=False,
+            unconditional_guidance_scale=1.0,
+            unconditional_conditioning=None,
+            eta=1.,
+            x_T=None,
+        )
+        samples_pred.append(pred)
+        return samples_pred
+
+    def _decode_classic_segmentation_latents(self, samples_pred):
+        if self.num_classes > 2:
+            out = torch.zeros((256, 256, self.num_classes), device=self.device)
+            for cls in range(0, self.num_classes):
+                decoded = self.decode_first_stage(samples_pred[cls])
+                if cls == 0:
+                    decoded *= -1
+                decoded = torch.mean(decoded, dim=1, keepdim=False)
+                out[:, :, cls] = decoded[0, ...]
+            probabilities = out.softmax(dim=2).detach().cpu().numpy()
+            prediction = probabilities.argmax(axis=2)
+            prediction = np.repeat(prediction[:, :, None], 3, axis=2)
+            return prediction, probabilities
+
+        decoded = self.decode_first_stage(samples_pred[0])
+        decoded = torch.clamp((decoded + 1.0) / 2.0, min=0.0, max=1.0)
+        decoded = decoded.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        probabilities = rearrange(decoded.squeeze(0).detach().cpu().numpy(), 'c h w -> h w c')
+        return probabilities > 0.5, probabilities
+
+    def _classic_segmentation_metrics(self, prediction, label):
+        if prediction.ndim == 3 and label.ndim == 2:
+            prediction = prediction[:, :, 0]
+        label = label.round().astype(int)
+        dice = []
+        iou = []
+        for cls in range(1, self.num_classes):
+            dice.append(dice_score(prediction == cls, label == cls))
+            iou.append(iou_score(prediction == cls, label == cls))
+        return np.array(dice), np.array(iou)
+
+    @torch.no_grad()
+    def predict_segmentation_batch(self, batch, sampler=None, use_direct=True, ddim_steps=50, noise=None):
+        """Run segmentation inference for one classic SDSeg 2D batch.
+
+        This exposes the same public API as ``videoSDSeg.SDSeg`` for notebook
+        analysis. Classic SDSeg does not accept temporal windows; temporal
+        experiments should use the videoSDSeg implementation.
+        """
+        image = batch["image"]
+        label = batch["segmentation"]
+
+        if not torch.is_tensor(image):
+            image = torch.as_tensor(image)
+        if not torch.is_tensor(label):
+            label = torch.as_tensor(label)
+
+        if image.ndim != 4:
+            raise ValueError(f"Classic SDSeg expects a single-frame 4D batch, got {tuple(image.shape)}.")
+        if image.shape[0] != 1:
+            raise ValueError("predict_segmentation_batch currently expects batch_size=1.")
+
+        image_np = image.detach().cpu().numpy()
+        label_np = label.detach().cpu().numpy()
+        if image_np.shape != label_np.shape:
+            raise AssertionError((image_np.shape, label_np.shape))
+
+        _, original_h, original_w, _ = label_np.shape
+        image_np = zoom(image_np, (1, 256 / original_h, 256 / original_w, 1), order=1)
+        label_np = zoom(label_np, (1, 256 / original_h, 256 / original_w, 1), order=0)
+        image_np = image_np.squeeze(0)
+        label_np = label_np.squeeze(0)
+        if image_np.shape[-1] > 3:
+            raise ValueError("Classic predict_segmentation_batch returns a single 2D prediction, not a volume.")
+
+        image_tensor = torch.from_numpy(image_np).unsqueeze(0).float().to(self.device)
+        conditioning = self._classic_conditioning_dict(image_tensor)
+        samples_pred = self._predict_classic_latents(
+            conditioning, sampler=sampler, use_direct=use_direct, ddim_steps=ddim_steps, noise=noise
+        )
+        prediction, probabilities = self._decode_classic_segmentation_latents(samples_pred)
+        label_2d = label_np[:, :, 0]
+        dice, iou = self._classic_segmentation_metrics(prediction, label_2d)
+        return {
+            "prediction": prediction,
+            "probabilities": probabilities,
+            "samples_pred": samples_pred,
+            "dice": dice,
+            "iou": iou,
+            "label": label_2d,
+            "image_for_log": image_np,
+            "conditioning_input": image_tensor,
+        }
+
     @torch.no_grad()
     def log_dice(self, data=None, save_dir=None, ddim_steps=50):
         """Run segmentation inference and compute Dice/IoU metrics.

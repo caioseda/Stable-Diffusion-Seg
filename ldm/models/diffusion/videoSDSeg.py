@@ -2068,6 +2068,104 @@ class SDSeg(LatentDiffusion):
             iou.append(iou_score(prediction == cls, label == cls))
         return np.array(dice), np.array(iou)
 
+    def _validate_segmentation_label(self, label):
+        if label.max() != self.num_classes - 1:
+            raise AssertionError(label.max())
+
+    def _infer_segmentation_slice(self, conditioning_input, label_2d, sampler=None,
+                                  use_direct=True, ddim_steps=50, noise=None):
+        self._validate_segmentation_label(label_2d)
+        conditioning = self._conditioning_dict(conditioning_input)
+        samples_pred = self._predict_segmentation_latents(
+            conditioning=conditioning,
+            sampler=sampler,
+            use_direct=use_direct,
+            ddim_steps=ddim_steps,
+            noise=noise,
+        )
+        prediction, probabilities = self._decode_segmentation_latents(samples_pred)
+        dice, iou = self._segmentation_metrics(prediction, label_2d)
+        return prediction, probabilities, samples_pred, dice, iou
+
+    @torch.no_grad()
+    def predict_segmentation_batch(self, batch, sampler=None, use_direct=True, ddim_steps=50, noise=None):
+        """Run segmentation inference for one dataloader batch.
+
+        Returns the decoded prediction, probabilities/logits, label, metrics,
+        and display-ready conditioning image for 2D batches. VFSS temporal
+        batches are supported directly; non-VFSS volumes should still use
+        ``log_dice`` because they expand into multiple slices.
+        """
+        image = batch["image"]
+        label = batch["segmentation"]
+
+        is_vfss_batch = (
+            torch.is_tensor(image)
+            and (
+                image.ndim == 5
+                or (
+                    image.ndim == 4
+                    and (image.shape[1] in [1, 3] or image.shape[-1] in [1, 3])
+                )
+            )
+            and torch.is_tensor(label)
+            and label.ndim in [3, 4]
+        )
+
+        if is_vfss_batch:
+            if image.shape[0] != 1:
+                raise ValueError("predict_segmentation_batch currently expects batch_size=1 for VFSS batches.")
+
+            normalized_image, center_image = self._normalize_conditioning_input(image)
+            image_for_log = self._ensure_hwc(center_image[0])
+            label_2d = self._label_to_2d(label)
+            prediction, probabilities, samples_pred, dice, iou = self._infer_segmentation_slice(
+                normalized_image, label_2d, sampler=sampler, use_direct=use_direct,
+                ddim_steps=ddim_steps, noise=noise
+            )
+            return {
+                "prediction": prediction,
+                "probabilities": probabilities,
+                "samples_pred": samples_pred,
+                "dice": dice,
+                "iou": iou,
+                "label": label_2d,
+                "image_for_log": image_for_log,
+                "conditioning_input": normalized_image,
+            }
+
+        image_np = self._as_numpy(image)
+        label_np = self._as_numpy(label)
+        if image_np.shape != label_np.shape:
+            raise AssertionError((image_np.shape, label_np.shape))
+
+        _, original_h, original_w, _ = label_np.shape
+        image_np = zoom(image_np, (1, 256 / original_h, 256 / original_w, 1), order=1)
+        label_np = zoom(label_np, (1, 256 / original_h, 256 / original_w, 1), order=0)
+        image_np = image_np.squeeze(0)
+        label_np = label_np.squeeze(0)
+
+        if image_np.shape[-1] > 3:
+            raise ValueError("predict_segmentation_batch returns a single prediction; use log_dice for volume batches.")
+
+        image_for_log = image_np
+        label_2d = label_np[:, :, 0]
+        conditioning_input = torch.from_numpy(image_np).unsqueeze(0).float().to(self.device)
+        prediction, probabilities, samples_pred, dice, iou = self._infer_segmentation_slice(
+            conditioning_input, label_2d, sampler=sampler, use_direct=use_direct,
+            ddim_steps=ddim_steps, noise=noise
+        )
+        return {
+            "prediction": prediction,
+            "probabilities": probabilities,
+            "samples_pred": samples_pred,
+            "dice": dice,
+            "iou": iou,
+            "label": label_2d,
+            "image_for_log": image_for_log,
+            "conditioning_input": conditioning_input,
+        }
+
     @staticmethod
     def _should_log_sample(index, total):
         interval = max(1, total // 8) if total else 1
@@ -2091,24 +2189,6 @@ class SDSeg(LatentDiffusion):
             if name == "direct":
                 return None
             raise NotImplementedError(f"Unsupported sampler: {name}")
-
-        def validate_label(label):
-            if label.max() != self.num_classes - 1:
-                raise AssertionError(label.max())
-
-        def infer_slice(conditioning_input, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=None):
-            validate_label(label_2d)
-            conditioning = self._conditioning_dict(conditioning_input)
-            samples_pred = self._predict_segmentation_latents(
-                conditioning=conditioning,
-                sampler=sampler,
-                use_direct=use_direct,
-                ddim_steps=ddim_steps,
-                noise=noise,
-            )
-            prediction, probabilities = self._decode_segmentation_latents(samples_pred)
-            dice, iou = self._segmentation_metrics(prediction, label_2d)
-            return prediction, probabilities, samples_pred, dice, iou
 
         def finalize_logs(log_state):
             try:
@@ -2145,6 +2225,9 @@ class SDSeg(LatentDiffusion):
                     sample_conditions=[],
                 )
 
+                dice_list = []
+                iou_list = []
+
                 pbar = tqdm(data, desc="Validating Segmentation")
                 for item_idx, prompts in enumerate(pbar):
                     slice_path = prompts["file_path_"]
@@ -2168,12 +2251,17 @@ class SDSeg(LatentDiffusion):
                         if image.shape[0] != 1:
                             raise ValueError("log_dice currently expects batch_size=1 for VFSS validation.")
 
-                        normalized_image, center_image = self._normalize_conditioning_input(image)
-                        image_for_log = self._ensure_hwc(center_image[0])
-                        label_2d = self._label_to_2d(label)
-                        prediction, probabilities, samples_pred, dice, iou = infer_slice(
-                            normalized_image, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=noise
+                        batch_result = self.predict_segmentation_batch(
+                            prompts, sampler=sampler, use_direct=use_direct,
+                            ddim_steps=ddim_steps, noise=noise
                         )
+                        image_for_log = batch_result["image_for_log"]
+                        label_2d = batch_result["label"]
+                        prediction = batch_result["prediction"]
+                        probabilities = batch_result["probabilities"]
+                        samples_pred = batch_result["samples_pred"]
+                        dice = batch_result["dice"]
+                        iou = batch_result["iou"]
 
                         pbar.set_postfix(dict(
                             label_cls=set(list(label_2d.flatten().astype(int))),
@@ -2194,13 +2282,17 @@ class SDSeg(LatentDiffusion):
 
                         dice_sum += dice
                         iou_sum += iou
+
+                        dice_list.append(dice)
+                        iou_list.append(iou)
+                        
                         continue
 
                     image_np = self._as_numpy(image)
                     label_np = self._as_numpy(label)
                     if image_np.shape != label_np.shape:
                         raise AssertionError((image_np.shape, label_np.shape))
-                    validate_label(label_np)
+                    self._validate_segmentation_label(label_np)
 
                     _, original_h, original_w, _ = label_np.shape
                     image_np = zoom(image_np, (1, 256 / original_h, 256 / original_w, 1), order=1)
@@ -2228,8 +2320,9 @@ class SDSeg(LatentDiffusion):
                             )
                             image_for_log = np.expand_dims(image_slice, 2).repeat(3, axis=2)
 
-                            prediction, probabilities, samples_pred, dice, iou = infer_slice(
-                                conditioning_input, image_for_log, label_slice, sampler, use_direct, ddim_steps, noise=noise
+                            prediction, probabilities, samples_pred, dice, iou = self._infer_segmentation_slice(
+                                conditioning_input, label_slice, sampler=sampler,
+                                use_direct=use_direct, ddim_steps=ddim_steps, noise=noise
                             )
                             prediction_volume[:, :, slice_idx] = prediction[:, :, 0]
                             pbar_sub.set_postfix(dict(
@@ -2261,8 +2354,9 @@ class SDSeg(LatentDiffusion):
                         image_for_log = image_np
                         label_2d = label_np[:, :, 0]
                         conditioning_input = torch.from_numpy(image_np).unsqueeze(0).float().to(self.device)
-                        prediction, probabilities, samples_pred, dice, iou = infer_slice(
-                            conditioning_input, image_for_log, label_2d, sampler, use_direct, ddim_steps, noise=noise
+                        prediction, probabilities, samples_pred, dice, iou = self._infer_segmentation_slice(
+                            conditioning_input, label_2d, sampler=sampler,
+                            use_direct=use_direct, ddim_steps=ddim_steps, noise=noise
                         )
                         pbar.set_postfix(dict(
                             label_cls=set(list(label_2d.flatten().astype(int))),
@@ -2280,18 +2374,31 @@ class SDSeg(LatentDiffusion):
                             self._append_segmentation_log_sample(
                                 log_state, image_for_log, label_2d, prediction, probabilities, samples_pred
                             )
+                        
 
                         dice_sum += dice
                         iou_sum += iou
+                    
+                    dice_list.append(dice)
+                    iou_list.append(iou)
+
                 pbar.close()
 
                 dice_mean = dice_sum / len(data)
                 iou_mean = iou_sum / len(data)
+
+                metrics = {
+                    "dice_mean": dice_mean,
+                    "iou_mean": iou_mean,
+                    "dice_list": dice_list,
+                    "iou_list": iou_list,
+                }
+
                 for cls in range(1, self.num_classes):
                     print(f"\033[31m[Mean Dice][cls {cls}]: {dice_mean[cls - 1]}\033[0m")
                     print(f"\033[31m[Mean  IoU][cls {cls}]: {iou_mean[cls - 1]}\033[0m")
 
-                return dice_mean, iou_mean, finalize_logs(log_state)
+                return metrics, finalize_logs(log_state)
 
             precision_scope = autocast
             with torch.no_grad():
@@ -2305,13 +2412,19 @@ class SDSeg(LatentDiffusion):
                             ddim_steps=ddim_steps,
                         )
 
-        ema_dice, ema_iou, seg_label_pair = get_dice(data, used_sampler="direct", save_dir=save_dir)
-        multi_dice, multi_iou = np.array(ema_dice), np.array(ema_iou)
+        metrics, seg_label_pair = get_dice(data, used_sampler="direct", save_dir=save_dir)
+        multi_dice, multi_iou = np.array(metrics['dice_mean']), np.array(metrics['iou_mean'])
+
         metrics_dict.update({"val_avg_dice/direct_ema": np.mean(multi_dice)})
         metrics_dict.update({"val_avg_iou/direct_ema": np.mean(multi_iou)})
+
+        metrics_dict.update({'dice_list/direct_ema': metrics['dice_list']})
+        metrics_dict.update({'iou_list/direct_ema': metrics['iou_list']})
+
         for cls in range(1, self.num_classes):
             metrics_dict.update({f"val_avg_dice/direct_ema_{cls}": multi_dice[cls - 1]})
             metrics_dict.update({f"val_avg_iou/direct_ema_{cls}": multi_iou[cls - 1]})
+        
         seg_label_dict.update({
             "latent_seg_label-direct_ema": seg_label_pair[0],
             "image_seg_label-direct-ema": seg_label_pair[1],
@@ -2319,7 +2432,11 @@ class SDSeg(LatentDiffusion):
 
         metrics_dict.update({"val_avg_dice": list(multi_dice)})
         metrics_dict.update({"val_avg_iou": list(multi_iou)})
-        return metrics_dict, seg_label_dict
+
+        metrics_dict.update({"val_dice/direct_ema": multi_dice})
+        metrics_dict.update({"val_iou/direct_ema": multi_iou})
+
+        return metrics_dict, seg_label_dict, 
 
     @staticmethod
     @torch.no_grad()
