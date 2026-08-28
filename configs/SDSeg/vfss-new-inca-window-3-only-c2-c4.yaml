@@ -93,25 +93,28 @@ data:
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 1
         stride: 1
         repeat_channels: True
+        target_folder: 'target_binary_c2_c4'
     validation:
       target: ldm.data.vfss_new.VFSSIncaVal
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 1
         stride: 1
         repeat_channels: True
+        target_folder: 'target_binary_c2_c4'
     test:
       target: ldm.data.vfss_new.VFSSIncaTest
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 1
         stride: 1
         repeat_channels: True
+        target_folder: 'target_binary_c2_c4'
 
 lightning:
   callbacks:

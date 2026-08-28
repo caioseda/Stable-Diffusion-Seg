@@ -93,7 +93,7 @@ data:
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 3
         stride: 1
         repeat_channels: True
     validation:
@@ -101,7 +101,7 @@ data:
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 3
         stride: 1
         repeat_channels: True
     test:
@@ -109,7 +109,7 @@ data:
       params:
         dataset_path: /data_ssd/caioseda/data/dataset_inca_all_frames/
         size: 256
-        window_size: 7
+        window_size: 3
         stride: 1
         repeat_channels: True
 
